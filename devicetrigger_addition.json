@@ -19,7 +19,7 @@
         "type": "DeviceTrigger",
         "inputs": [],
         "outputs": [{"id": "out1", "type": "async_float"}],
-        "parameters": {"min_interval": 500, "max_interval": 1000}
+        "parameters": {"min_interval": 5000, "max_interval": 10000}
       },
       {
         "id": "add1",

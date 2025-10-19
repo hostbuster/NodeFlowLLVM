@@ -7,6 +7,9 @@
 #include <chrono>
 #include <random>
 #include <iostream>
+#if NODEFLOW_HAS_CLI11
+#include <CLI/CLI.hpp>
+#endif
 
 // Global state for async triggers
 std::atomic<bool> key1_triggered(false);
@@ -50,6 +53,10 @@ extern "C" int isKeyPressed(const char* key) {
         if (key[0] == '2') key2_triggered = true;
         return 1;
     }
+    // If a different key was pressed, push it back so other checks can consume it
+    if (ch != ERR) {
+        ungetch(ch);
+    }
     return 0;
 }
 
@@ -67,40 +74,90 @@ extern "C" float getRandomNumber() {
     return random_value;
 }
 
-int main() {
+int main(int argc, char** argv) {
     // Initialize random seed
     std::srand(std::time(nullptr));
 
     // Load JSON flow
     NodeFlow::FlowEngine engine;
+    // Resolve flow file path
+    std::string flowPath = "devicetrigger_addition.json";
+#if NODEFLOW_HAS_CLI11
+    try {
+        CLI::App app{"NodeFlowCore"};
+        app.add_option("--flow", flowPath, "Path to flow JSON file");
+        app.allow_extras(false);
+        app.validate_positionals();
+        app.set_config();
+        app.set_help_all_flag("--help-all", "Show all help");
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError &e) {
+        return CLI::Exit(e);
+    }
+#else
+    // Simple fallback: parse --flow=<path>
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        const std::string prefix = "--flow=";
+        if (arg.rfind(prefix, 0) == 0) {
+            flowPath = arg.substr(prefix.size());
+        } else if (arg == "--flow" && i + 1 < argc) {
+            flowPath = argv[++i];
+        }
+    }
+#endif
+
     nlohmann::json json;
     {
-        std::ifstream file1("devicetrigger_addition.json");
-        if (file1.good()) {
-            file1 >> json;
+        std::ifstream f(flowPath);
+        if (f.good()) {
+            f >> json;
         } else {
-            std::ifstream file2("../devicetrigger_addition.json");
-            if (file2.good()) {
-                file2 >> json;
+            std::ifstream f2("../" + flowPath);
+            if (f2.good()) {
+                f2 >> json;
             } else {
-                std::ifstream file3("../../devicetrigger_addition.json");
-                if (file3.good()) {
-                    file3 >> json;
+                std::ifstream f3("../../" + flowPath);
+                if (f3.good()) {
+                    f3 >> json;
                 } else {
-                    throw std::runtime_error("Could not find devicetrigger_addition.json in ., .., or ../..\n");
+                    throw std::runtime_error("Could not find flow file: " + flowPath);
                 }
             }
         }
     }
     engine.loadFromJson(json);
 
+    // Resolve random trigger intervals from JSON (fallback to defaults)
+    int rand_min_ms = 100;
+    int rand_max_ms = 500;
+    try {
+        if (json.contains("nodes") && json["nodes"].is_array()) {
+            for (const auto& n : json["nodes"]) {
+                if (n.contains("type") && n["type"].is_string() && n["type"].get<std::string>() == "DeviceTrigger") {
+                    if (n.contains("parameters") && n["parameters"].is_object()) {
+                        const auto& p = n["parameters"];
+                        if (p.contains("min_interval") && p["min_interval"].is_number_integer()) {
+                            rand_min_ms = p["min_interval"].get<int>();
+                        }
+                        if (p.contains("max_interval") && p["max_interval"].is_number_integer()) {
+                            rand_max_ms = p["max_interval"].get<int>();
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {
+        // keep defaults
+    }
+
     // Generate standalone binary from current flow (no interaction needed)
 #if NODEFLOW_CODEGEN
     engine.compileToExecutable("nodeflow_output");
 #endif
 
-    // Start random number thread
-    std::thread random_thread(randomNumberThread, 100, 500);
+    // Start random number thread with JSON-configured intervals
+    std::thread random_thread(randomNumberThread, rand_min_ms, rand_max_ms);
 
     // Initialize ncurses
     initscr();
@@ -110,25 +167,43 @@ int main() {
     printw("Press '1' or '2' to trigger values, 'q' to quit\n");
 
     // Main loop: Run flow and update display
-    float last_sum = -1.0f;
+    float last_sum = -9999.0f;
     while (running) {
         engine.execute();
         auto outputs = engine.getOutputs();
-        float sum = 0.0f;
-        if (outputs.count("add1") && !outputs["add1"].empty() && std::holds_alternative<float>(outputs["add1"][0])) {
-            sum = std::get<float>(outputs["add1"][0]);
+        auto getFloat = [&](const std::string& nodeId) -> float {
+            if (!outputs.count(nodeId) || outputs[nodeId].empty()) return 0.0f;
+            const auto& v = outputs[nodeId][0];
+            if (std::holds_alternative<float>(v)) return std::get<float>(v);
+            if (std::holds_alternative<double>(v)) return static_cast<float>(std::get<double>(v));
+            if (std::holds_alternative<int>(v)) return static_cast<float>(std::get<int>(v));
+            return 0.0f;
+        };
+
+        float key1_val = getFloat("key1");
+        float key2_val = getFloat("key2");
+        float random_val = getFloat("random1");
+        float engine_sum = 0.0f;
+        if (outputs.count("add1") && !outputs["add1"].empty()) {
+            const auto& v = outputs["add1"][0];
+            engine_sum = std::holds_alternative<float>(v) ? std::get<float>(v)
+                        : std::holds_alternative<double>(v) ? static_cast<float>(std::get<double>(v))
+                        : std::holds_alternative<int>(v) ? static_cast<float>(std::get<int>(v))
+                        : 0.0f;
         }
+        float calc_sum = key1_val + key2_val + random_val;
 
         // Update display only if sum changes
-        if (sum != last_sum) {
+        if (calc_sum != last_sum) {
             clear();
             printw("Press '1' or '2' to trigger values, 'q' to quit\n");
-            printw("Current sum: %.2f\n", sum);
-            printw("Key1 (1.0): %s\n", key1_triggered ? "Triggered" : "Waiting");
-            printw("Key2 (2.0): %s\n", key2_triggered ? "Triggered" : "Waiting");
-            printw("Random (0-100): %.2f\n", random_value.load());
+            printw("Key1 value:   %.2f\n", key1_val);
+            printw("Key2 value:   %.2f\n", key2_val);
+            printw("Random value: %.2f\n", random_val);
+            printw("Sum (calc):   %.2f\n", calc_sum);
+            printw("Sum (engine): %.2f\n", engine_sum);
             refresh();
-            last_sum = sum;
+            last_sum = calc_sum;
         }
 
         // Small delay to prevent CPU overuse

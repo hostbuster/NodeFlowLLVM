@@ -11,6 +11,9 @@ option(NODEFLOW_CODEGEN "Enable standalone code generation" ON)
 # Find nlohmann_json
 find_package(nlohmann_json REQUIRED)
 
+# Optional CLI11
+find_package(CLI11 QUIET)
+
 # Find ncurses
 find_package(Curses REQUIRED)
 include_directories(${CURSES_INCLUDE_DIR})
@@ -20,6 +23,12 @@ add_executable(NodeFlowCore main.cpp NodeFlowCore.cpp)
 
 # Link libraries (drop LLVM for now)
 target_link_libraries(NodeFlowCore nlohmann_json::nlohmann_json ${CURSES_LIBRARIES})
+if(CLI11_FOUND)
+  target_link_libraries(NodeFlowCore CLI11::CLI11)
+  target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_HAS_CLI11=1)
+else()
+  target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_HAS_CLI11=0)
+endif()
 
 # Set output directory for the compiled executable
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

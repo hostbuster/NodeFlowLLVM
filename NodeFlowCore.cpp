@@ -15,29 +15,44 @@ namespace NodeFlow {
 // Declarations are provided in header; definitions are implemented in main.cpp
 
 void Node::execute(std::unordered_map<PortId, Value>& portValues) {
+    auto makeKey = [&](const std::string& portId) { return id + ":" + portId; };
     if (type == "Value") {
         if (parameters.count("value")) {
             for (auto& output : outputs) {
-                portValues[output.id] = parameters.at("value");
+                portValues[makeKey(output.id)] = parameters.at("value");
+                output.value = parameters.at("value");
             }
         }
     } else if (type == "DeviceTrigger") {
+        // Non-blocking: if event ready, publish new value; otherwise reuse last output
         if (parameters.count("key")) {
-            std::string key = std::get<std::string>(parameters.at("key"));
-            while (!isKeyPressed(key.c_str())) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
+            const std::string key = std::get<std::string>(parameters.at("key"));
+            const bool ready = isKeyPressed(key.c_str()) != 0;
             for (auto& output : outputs) {
-                portValues[output.id] = parameters.at("value");
+                Value newVal = output.value;
+                if (ready && parameters.count("value")) {
+                    const Value& p = parameters.at("value");
+                    if (std::holds_alternative<float>(p)) newVal = std::get<float>(p);
+                    else if (std::holds_alternative<double>(p)) newVal = static_cast<float>(std::get<double>(p));
+                    else if (std::holds_alternative<int>(p)) newVal = static_cast<float>(std::get<int>(p));
+                }
+                output.value = newVal;
+                portValues[makeKey(output.id)] = newVal;
             }
         } else if (parameters.count("min_interval")) {
-            int min = std::get<int>(parameters.at("min_interval"));
-            int max = std::get<int>(parameters.at("max_interval"));
-            while (!isRandomReady(min, max)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
+            const int min = std::get<int>(parameters.at("min_interval"));
+            const int max = std::get<int>(parameters.at("max_interval"));
+            const bool ready = isRandomReady(min, max) != 0;
             for (auto& output : outputs) {
-                portValues[output.id] = getRandomNumber();
+                Value newVal = output.value;
+                if (ready) newVal = static_cast<float>(getRandomNumber());
+                output.value = newVal;
+                portValues[makeKey(output.id)] = newVal;
+            }
+        } else {
+            // No parameters; just reuse last
+            for (auto& output : outputs) {
+                portValues[makeKey(output.id)] = output.value;
             }
         }
     } else if (type == "Add") {
@@ -60,42 +75,50 @@ void Node::execute(std::unordered_map<PortId, Value>& portValues) {
         if (dataType == "int") {
             int sum = 0;
             for (const auto& input : inputs) {
-                if (portValues.count(input.id) && std::holds_alternative<int>(portValues[input.id])) {
-                    sum += std::get<int>(portValues[input.id]);
+                auto key = makeKey(input.id);
+                if (portValues.count(key) && std::holds_alternative<int>(portValues[key])) {
+                    sum += std::get<int>(portValues[key]);
                 }
             }
             for (auto& output : outputs) {
-                portValues[output.id] = sum;
+                output.value = sum;
+                portValues[makeKey(output.id)] = sum;
             }
         } else if (dataType == "float") {
             float sum = 0.0f;
             for (const auto& input : inputs) {
-                if (portValues.count(input.id) && std::holds_alternative<float>(portValues[input.id])) {
-                    sum += std::get<float>(portValues[input.id]);
+                auto key = makeKey(input.id);
+                if (portValues.count(key) && std::holds_alternative<float>(portValues[key])) {
+                    sum += std::get<float>(portValues[key]);
                 }
             }
             for (auto& output : outputs) {
-                portValues[output.id] = sum;
+                output.value = sum;
+                portValues[makeKey(output.id)] = sum;
             }
         } else if (dataType == "double") {
             double sum = 0.0;
             for (const auto& input : inputs) {
-                if (portValues.count(input.id) && std::holds_alternative<double>(portValues[input.id])) {
-                    sum += std::get<double>(portValues[input.id]);
+                auto key = makeKey(input.id);
+                if (portValues.count(key) && std::holds_alternative<double>(portValues[key])) {
+                    sum += std::get<double>(portValues[key]);
                 }
             }
             for (auto& output : outputs) {
-                portValues[output.id] = sum;
+                output.value = sum;
+                portValues[makeKey(output.id)] = sum;
             }
         } else if (dataType == "string") {
             std::string result;
             for (const auto& input : inputs) {
-                if (portValues.count(input.id) && std::holds_alternative<std::string>(portValues[input.id])) {
-                    result += std::get<std::string>(portValues[input.id]);
+                auto key = makeKey(input.id);
+                if (portValues.count(key) && std::holds_alternative<std::string>(portValues[key])) {
+                    result += std::get<std::string>(portValues[key]);
                 }
             }
             for (auto& output : outputs) {
-                portValues[output.id] = result;
+                output.value = result;
+                portValues[makeKey(output.id)] = result;
             }
         }
     }
@@ -118,7 +141,7 @@ void FlowEngine::loadFromJson(const nlohmann::json& json) {
             node.outputs.push_back({output["id"].get<std::string>(), "output", output["type"].get<std::string>(), Value{0.0f}});
         }
         if (nodeJson.contains("parameters") && nodeJson["parameters"].is_object()) {
-            for (const auto& param : nodeJson["parameters"].items()) {
+        for (const auto& param : nodeJson["parameters"].items()) {
                 // Use the actual JSON type for parameters (keys may be strings even if outputs are numeric)
                 if (param.value().is_string()) {
                     node.parameters[param.key()] = param.value().get<std::string>();
@@ -197,22 +220,36 @@ void FlowEngine::computeExecutionOrder() {
 
 void FlowEngine::execute() {
     std::unordered_map<PortId, Value> portValues;
+    auto makeKey = [](const std::string& nodeId, const std::string& portId) { return nodeId + ":" + portId; };
+    // Seed with last outputs so downstream consumers see previous values if no new events
     for (const auto& node : nodes) {
-        for (const auto& input : node.inputs) {
-            if (node.parameters.count("value")) {
-                portValues[input.id] = node.parameters.at("value");
-            }
+        for (const auto& output : node.outputs) {
+            portValues[makeKey(node.id, output.id)] = output.value;
         }
     }
+    // Initial propagation
     for (const auto& conn : connections) {
-        if (portValues.count(conn.fromPort)) {
-            portValues[conn.toPort] = portValues[conn.fromPort];
+        auto fromKey = makeKey(conn.fromNode, conn.fromPort);
+        auto toKey = makeKey(conn.toNode, conn.toPort);
+        if (portValues.count(fromKey)) {
+            portValues[toKey] = portValues[fromKey];
         }
     }
+    // Execute nodes in order; after each node, propagate its outputs to consumers
     for (const auto& nodeId : executionOrder) {
         auto it = std::find_if(nodes.begin(), nodes.end(), [&](const Node& n) { return n.id == nodeId; });
-        if (it != nodes.end()) {
-            it->execute(portValues);
+        if (it == nodes.end()) continue;
+        it->execute(portValues);
+        // Propagate fresh outputs from this node
+        for (const auto& out : it->outputs) {
+            auto outKey = makeKey(it->id, out.id);
+            portValues[outKey] = out.value;
+            for (const auto& conn : connections) {
+                if (conn.fromNode == it->id && conn.fromPort == out.id) {
+                    auto toKey = makeKey(conn.toNode, conn.toPort);
+                    portValues[toKey] = out.value;
+                }
+            }
         }
     }
 }
