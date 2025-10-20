@@ -89,6 +89,9 @@ if(NOT CLI11_FOUND)
   FetchContent_MakeAvailable(CLI11)
 endif()
 
+# fmt (required)
+find_package(fmt REQUIRED)
+
 
 # Header-only Simple-WebSocket-Server (INTERFACE)
 add_library(Simple-WebSocket-Server INTERFACE)
@@ -137,6 +140,7 @@ if(NODEFLOW_BUILD_RUNTIME)
   target_link_libraries(NodeFlowCore PRIVATE
       nlohmann_json::nlohmann_json
   )
+  target_link_libraries(NodeFlowCore PRIVATE fmt::fmt)
   # Always enable WebSocket IPC
   target_link_libraries(NodeFlowCore PRIVATE Simple-WebSocket-Server)
   # Fallback include/libs if imported targets are not available
@@ -184,6 +188,6 @@ foreach(STEP_SRC ${NODEFLOW_STEP_SOURCES})
   add_executable(${BASE_NAME}_host aot_host_template.cpp)
   target_include_directories(${BASE_NAME}_host PRIVATE ${CMAKE_SOURCE_DIR})
   target_compile_definitions(${BASE_NAME}_host PRIVATE STEP_HEADER=${STEP_NAME}.h)
-  target_link_libraries(${BASE_NAME}_host PRIVATE ${BASE_NAME}_step)
+  target_link_libraries(${BASE_NAME}_host PRIVATE ${BASE_NAME}_step fmt::fmt)
   set_target_properties(${BASE_NAME}_host PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 endforeach()

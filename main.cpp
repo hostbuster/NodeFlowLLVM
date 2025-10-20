@@ -7,9 +7,9 @@
 #include <random>
 #include <iostream>
 #include <CLI/CLI.hpp>
+#include <fmt/core.h>
 #include "third_party/Simple-WebSocket-Server/server_ws.hpp"
 #include <mutex>
-#include <atomic>
 
 // Global state
 std::atomic<bool> running(true);
@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
 
     // Initialize ncurses (optional)
     // Startup message
-    std::cout << "NodeFlowCore started. WS=on, flow='" << flowPath << "'\n";
+    fmt::print("NodeFlowCore started. WS=on, flow='{}'\n", flowPath);
 
     // WebSocket server (optional)
     using WsServer = SimpleWeb::SocketServer<SimpleWeb::WS>;
@@ -219,9 +219,9 @@ int main(int argc, char** argv) {
         ep.on_open = [&](auto conn){
             std::lock_guard<std::mutex> lock(wsMutex);
             if (!latestJson.empty()) conn->send(latestJson);
-            std::cout << "client connected" << std::endl;
+            fmt::print("client connected\n");
         };
-        ep.on_close = [&](auto /*conn*/, int /*status*/, const std::string& /*reason*/){ std::cout << "client disconnected" << std::endl; };
+        ep.on_close = [&](auto /*conn*/, int /*status*/, const std::string& /*reason*/){ fmt::print("client disconnected\n"); };
 
         wsThread = std::thread([&]{ wsServer->start(); });
     }
@@ -260,11 +260,9 @@ int main(int argc, char** argv) {
 
         {
             // Emit a compact JSON snapshot for the demo
-            char buf[256];
-            int n = std::snprintf(buf, sizeof(buf),
-                "{\"type\":\"snapshot\",\"key1\":%.3f,\"key2\":%.3f,\"random1\":%.3f,\"add1\":%.3f}\n",
+            std::string json = fmt::format(
+                "{{\"type\":\"snapshot\",\"key1\":{:.3f},\"key2\":{:.3f},\"random1\":{:.3f},\"add1\":{:.3f}}}\n",
                 key1_val, key2_val, random_val, engine_sum);
-            std::string json(buf, n > 0 ? (size_t)n : 0);
             {
                 std::lock_guard<std::mutex> lock(wsMutex);
                 latestJson = json;

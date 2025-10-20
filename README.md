@@ -38,7 +38,7 @@ This eliminates manual event-loop coding and enables rapid prototyping of comple
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
 # Dependencies
-brew install llvm nlohmann-json asio openssl@3 cmake
+brew install llvm nlohmann-json asio openssl@3 cmake fmt
 ```
 
 Note: On macOS Apple Silicon, prefer Homebrew at `/opt/homebrew`. We link against `openssl@3` and use standalone `asio`.
@@ -60,7 +60,7 @@ make -j
 #### Run (runtime, headless + WebSockets)
 
 ```bash
-./NodeFlowCore --flow devicetrigger_addition.json --ws-enable
+./NodeFlowCore --flow devicetrigger_addition.json
 ```
 
 - **Interact** (web UI): open `web/index.html` in your browser; it connects to `ws://127.0.0.1:9002/stream`.
@@ -73,11 +73,10 @@ make -j
 - `--flow <path>`: specify the flow JSON file. If omitted, defaults to `devicetrigger_addition.json` with fallback search in `.`/`..`/`../..`.
 - `--build-aot`: generate an AOT step-function library and exit. Files are named `<basename>_step.h/.cpp` (basename from the JSON filename).
 - `--out-dir <dir>`: when used with `--build-aot`, write generated files into the directory.
-- WebSockets (if enabled at build time with `-DNODEFLOW_WS_ENABLE=ON`):
-  - `--ws-enable`: enable WebSocket server (default on when WS is compiled in)
-  - `--ws-port <int>`: port (default 9002)
-  - `--ws-path <string>`: path (default `/stream`)
-  - `--ws-throttle-hz <int>`: max messages per second (default 20)
+  
+WebSockets are always enabled; the server runs by default. You can configure:
+- `--ws-port <int>`: port (default 9002)
+- `--ws-path <string>`: path (default `/stream`)
 
 Examples:
 
@@ -119,16 +118,10 @@ cmake -S . -B build -DNODEFLOW_BUILD_RUNTIME=OFF && cmake --build build
 
 ### WebSocket streaming + Web UI
 
-- Build with WS enabled:
+- Run runtime and open the web client:
 
 ```bash
-cmake -S . -B build -DNODEFLOW_WS_ENABLE=ON && cmake --build build
-```
-
-- Run runtime with WS on and open the web client:
-
-```bash
-./build/NodeFlowCore --flow devicetrigger_addition.json --ws-enable
+./build/NodeFlowCore --flow devicetrigger_addition.json
 # Then open web/index.html (connects to ws://127.0.0.1:9002/stream)
 ```
 
@@ -138,7 +131,6 @@ cmake -S . -B build -DNODEFLOW_WS_ENABLE=ON && cmake --build build
 
 - `-DNODEFLOW_CODEGEN=ON|OFF` (default ON): include the demo standalone codegen (`nodeflow_output`). We will iterate on LLVM/codegen next.
 - `-DNODEFLOW_BUILD_RUNTIME=ON|OFF` (default ON): build the interactive runtime `NodeFlowCore`.
-- `-DNODEFLOW_WS_ENABLE=ON|OFF` (default OFF): enable WebSocket support in the runtime.
 
 ### Files
 
