@@ -47,6 +47,11 @@ public:
     void execute();
     std::unordered_map<NodeId, std::vector<Value>> getOutputs() const;
     void compileToExecutable(const std::string& outputFile, bool dslMode = true);
+    void generateStepLibrary(const std::string& baseName) const;
+
+    // Control helpers for runtime/IPC
+    void setNodeValue(const std::string& nodeId, float value);
+    void setNodeConfigMinMax(const std::string& nodeId, int minIntervalMs, int maxIntervalMs);
 
 private:
     std::vector<Node> nodes;

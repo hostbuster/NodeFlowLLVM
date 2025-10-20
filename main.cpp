@@ -1,7 +1,6 @@
 #include "NodeFlowCore.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
-#include <ncurses.h>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -10,69 +9,19 @@
 #if NODEFLOW_HAS_CLI11
 #include <CLI/CLI.hpp>
 #endif
+#if NODEFLOW_WS_ENABLE
+#include "third_party/Simple-WebSocket-Server/server_ws.hpp"
+#include <mutex>
+#include <atomic>
+#endif
 
-// Global state for async triggers
-std::atomic<bool> key1_triggered(false);
-std::atomic<bool> key2_triggered(false);
-std::atomic<bool> random_triggered(false);
-std::atomic<float> random_value(0.0f);
+// Global state
 std::atomic<bool> running(true);
 
-// Thread function for random number generation
-void randomNumberThread(int min_interval, int max_interval) {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dist(min_interval, max_interval);
-    std::uniform_real_distribution<float> value_dist(0.0f, 100.0f);
-
-    while (running) {
-        random_value = value_dist(gen);
-        random_triggered = true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(dist(gen)));
-    }
-}
-
-// Override isKeyPressed to use ncurses
-extern "C" int isKeyPressed(const char* key) {
-    static bool initialized = false;
-    if (!initialized) {
-        initscr();
-        cbreak();
-        noecho();
-        nodelay(stdscr, TRUE);
-        initialized = true;
-    }
-    int ch = getch();
-    if (ch == 'q') {
-        running = false;
-        endwin();
-        return 0;
-    }
-    if (ch == key[0]) {
-        if (key[0] == '1') key1_triggered = true;
-        if (key[0] == '2') key2_triggered = true;
-        return 1;
-    }
-    // If a different key was pressed, push it back so other checks can consume it
-    if (ch != ERR) {
-        ungetch(ch);
-    }
-    return 0;
-}
-
-// Override isRandomReady to check thread trigger
-extern "C" int isRandomReady(int min_interval, int max_interval) {
-    if (random_triggered) {
-        random_triggered = false;
-        return 1;
-    }
-    return 0;
-}
-
-// Override getRandomNumber to use thread-generated value
-extern "C" float getRandomNumber() {
-    return random_value;
-}
+// Legacy C ABI hooks are not used in headless mode
+extern "C" int isKeyPressed(const char*) { return 0; }
+extern "C" int isRandomReady(int, int) { return 0; }
+extern "C" float getRandomNumber() { return 0.0f; }
 
 int main(int argc, char** argv) {
     // Initialize random seed
@@ -82,10 +31,26 @@ int main(int argc, char** argv) {
     NodeFlow::FlowEngine engine;
     // Resolve flow file path
     std::string flowPath = "devicetrigger_addition.json";
+    bool buildAOT = false;
+    std::string outDir;
+#if NODEFLOW_WS_ENABLE
+    bool wsEnable = true;
+    int wsPort = 9002;
+    std::string wsPath = "/stream";
+    int wsThrottleHz = 20;
+#endif
 #if NODEFLOW_HAS_CLI11
     try {
         CLI::App app{"NodeFlowCore"};
         app.add_option("--flow", flowPath, "Path to flow JSON file");
+        app.add_flag("--build-aot", buildAOT, "Generate AOT step library using flow basename");
+        app.add_option("--out-dir", outDir, "Directory to write generated AOT files");
+#if NODEFLOW_WS_ENABLE
+        app.add_flag("--ws-enable", wsEnable, "Enable WebSocket streaming");
+        app.add_option("--ws-port", wsPort, "WebSocket port");
+        app.add_option("--ws-path", wsPath, "WebSocket path (e.g., /stream)");
+        app.add_option("--ws-throttle-hz", wsThrottleHz, "Max messages per second");
+#endif
         app.allow_extras(false);
         app.validate_positionals();
         app.set_config();
@@ -103,6 +68,20 @@ int main(int argc, char** argv) {
             flowPath = arg.substr(prefix.size());
         } else if (arg == "--flow" && i + 1 < argc) {
             flowPath = argv[++i];
+        } else if (arg == "--build-aot") {
+            buildAOT = true;
+        } else if (arg == "--out-dir" && i + 1 < argc) {
+            outDir = argv[++i];
+#if NODEFLOW_WS_ENABLE
+        } else if (arg == "--ws-enable") {
+            wsEnable = true;
+        } else if (arg == "--ws-port" && i + 1 < argc) {
+            wsPort = std::atoi(argv[++i]);
+        } else if (arg == "--ws-path" && i + 1 < argc) {
+            wsPath = argv[++i];
+        } else if (arg == "--ws-throttle-hz" && i + 1 < argc) {
+            wsThrottleHz = std::atoi(argv[++i]);
+#endif
         }
     }
 #endif
@@ -151,20 +130,145 @@ int main(int argc, char** argv) {
         // keep defaults
     }
 
+    // AOT generation (Option B) using flow basename
+    if (buildAOT) {
+        auto slash = flowPath.find_last_of("/\\");
+        std::string base = (slash == std::string::npos) ? flowPath : flowPath.substr(slash + 1);
+        auto dot = base.rfind('.');
+        if (dot != std::string::npos) base = base.substr(0, dot);
+        if (!outDir.empty()) {
+            // chdir to outDir for generation, then return
+            std::error_code ec;
+            // POSIX chdir is fine; use std::filesystem in C++17 for path ops
+            // We'll just prefix base with outDir when writing files by temporarily changing cwd
+            // Simpler: prepend outDir to base
+            base = outDir + "/" + base;
+        }
+        engine.generateStepLibrary(base);
+        // Do not start runtime when building AOT artifacts
+        return 0;
+    }
+
     // Generate standalone binary from current flow (no interaction needed)
 #if NODEFLOW_CODEGEN
     engine.compileToExecutable("nodeflow_output");
 #endif
 
-    // Start random number thread with JSON-configured intervals
-    std::thread random_thread(randomNumberThread, rand_min_ms, rand_max_ms);
+    // No random thread needed; runtime is fully headless
 
-    // Initialize ncurses
-    initscr();
-    cbreak();
-    noecho();
-    nodelay(stdscr, TRUE);
-    printw("Press '1' or '2' to trigger values, 'q' to quit\n");
+    // Initialize ncurses (optional)
+    // Startup message
+    std::cout << "NodeFlowCore started. WS=" << (wsEnable?"on":"off") << ", flow='" << flowPath << "'\n";
+
+    // WebSocket server (optional)
+#if NODEFLOW_WS_ENABLE
+    using WsServer = SimpleWeb::SocketServer<SimpleWeb::WS>;
+    std::unique_ptr<WsServer> wsServer;
+    std::thread wsThread;
+    std::mutex wsMutex;
+    std::string latestJson; // last snapshot/delta, for simple demo
+    if (wsEnable) {
+        wsServer = std::make_unique<WsServer>();
+        wsServer->config.port = wsPort;
+
+        // Simple-WebSocket-Server expects a regex endpoint; wrap /path as ^/path$
+        std::string wsPattern = wsPath;
+        if (wsPattern.empty() || wsPattern.front() != '^') wsPattern = "^" + wsPattern + "$";
+
+        auto &ep = wsServer->endpoint[wsPattern];
+
+        ep.on_message = [&, wsPattern](auto conn, auto msg){
+            try {
+                auto data = msg->string();
+                // Expect small JSON commands like: {"type":"set","node":"key1","value":1.0}
+                // Minimal parser: look for substrings (to avoid dep)
+                auto has = [&](const char* s){ return data.find(s) != std::string::npos; };
+                auto getStr = [&](const char* key)->std::string{
+                    auto p = data.find(std::string("\"") + key + "\"");
+                    if (p == std::string::npos) return {};
+                    p = data.find(':', p);
+                    if (p == std::string::npos) return {};
+                    auto q1 = data.find('"', p+1);
+                    auto q2 = data.find('"', q1+1);
+                    if (q1 == std::string::npos || q2 == std::string::npos) return {};
+                    return data.substr(q1+1, q2-q1-1);
+                };
+                auto getNum = [&](const char* key)->double{
+                    auto p = data.find(std::string("\"") + key + "\"");
+                    if (p == std::string::npos) return 0.0;
+                    p = data.find(':', p);
+                    if (p == std::string::npos) return 0.0;
+                    auto q = data.find_first_of(",}\n ", p+1);
+                    auto s = data.substr(p+1, (q==std::string::npos?data.size():q) - (p+1));
+                    return std::atof(s.c_str());
+                };
+                auto type = getStr("type");
+                auto broadcastSnapshot = [&](){
+                    engine.execute();
+                    auto outs = engine.getOutputs();
+                    auto getF = [&](const char* id){
+                        auto it = outs.find(id);
+                        if (it == outs.end() || it->second.empty()) return 0.0f;
+                        const auto &v = it->second[0];
+                        if (std::holds_alternative<float>(v)) return std::get<float>(v);
+                        if (std::holds_alternative<double>(v)) return static_cast<float>(std::get<double>(v));
+                        if (std::holds_alternative<int>(v)) return static_cast<float>(std::get<int>(v));
+                        return 0.0f;
+                    };
+                    char buf[256];
+                    int n = std::snprintf(buf, sizeof(buf),
+                        "{\"type\":\"snapshot\",\"key1\":%.3f,\"key2\":%.3f,\"random1\":%.3f,\"add1\":%.3f}\n",
+                        getF("key1"), getF("key2"), getF("random1"), getF("add1"));
+                    std::string json(buf, n > 0 ? (size_t)n : 0);
+                    {
+                        std::lock_guard<std::mutex> lock(wsMutex);
+                        latestJson = json;
+                    }
+                    auto it_ep = wsServer->endpoint.find(wsPattern);
+                    if (it_ep != wsServer->endpoint.end()) {
+                        for (auto &c2 : it_ep->second.get_connections()) {
+                            c2->send(json);
+                        }
+                    }
+                };
+                if (type == "set") {
+                    auto node = getStr("node");
+                    float value = static_cast<float>(getNum("value"));
+                    engine.setNodeValue(node, value);
+                    conn->send("{\"ok\":true}\n");
+                    broadcastSnapshot();
+                } else if (type == "config") {
+                    auto node = getStr("node");
+                    int minI = static_cast<int>(getNum("min_interval"));
+                    int maxI = static_cast<int>(getNum("max_interval"));
+                    engine.setNodeConfigMinMax(node, minI, maxI);
+                    conn->send("{\"ok\":true}\n");
+                    broadcastSnapshot();
+                } else if (type == "reload") {
+                    auto path = getStr("flow");
+                    std::ifstream f(path);
+                    if (f.good()) { nlohmann::json j; f >> j; engine.loadFromJson(j); conn->send("{\"ok\":true}\n"); broadcastSnapshot(); }
+                    else conn->send("{\"ok\":false}\n");
+                } else if (type == "subscribe") {
+                    conn->send("{\"ok\":true}\n");
+                } else {
+                    conn->send("{\"ok\":false,\"err\":\"unknown type\"}\n");
+                }
+            } catch(...) {
+                try { conn->send("{\"ok\":false}\n"); } catch(...) {}
+            }
+        };
+
+        ep.on_open = [&](auto conn){
+            std::lock_guard<std::mutex> lock(wsMutex);
+            if (!latestJson.empty()) conn->send(latestJson);
+            std::cout << "client connected" << std::endl;
+        };
+        ep.on_close = [&](auto /*conn*/, int /*status*/, const std::string& /*reason*/){ std::cout << "client disconnected" << std::endl; };
+
+        wsThread = std::thread([&]{ wsServer->start(); });
+    }
+#endif
 
     // Main loop: Run flow and update display
     float last_sum = -9999.0f;
@@ -195,25 +299,40 @@ int main(int argc, char** argv) {
 
         // Update display only if sum changes
         if (calc_sum != last_sum) {
-            clear();
-            printw("Press '1' or '2' to trigger values, 'q' to quit\n");
-            printw("Key1 value:   %.2f\n", key1_val);
-            printw("Key2 value:   %.2f\n", key2_val);
-            printw("Random value: %.2f\n", random_val);
-            printw("Sum (calc):   %.2f\n", calc_sum);
-            printw("Sum (engine): %.2f\n", engine_sum);
-            refresh();
             last_sum = calc_sum;
         }
+
+#if NODEFLOW_WS_ENABLE
+        if (wsEnable) {
+            // Emit a compact JSON snapshot for the demo
+            char buf[256];
+            int n = std::snprintf(buf, sizeof(buf),
+                "{\"type\":\"snapshot\",\"key1\":%.3f,\"key2\":%.3f,\"random1\":%.3f,\"add1\":%.3f}\n",
+                key1_val, key2_val, random_val, engine_sum);
+            std::string json(buf, n > 0 ? (size_t)n : 0);
+            {
+                std::lock_guard<std::mutex> lock(wsMutex);
+                latestJson = json;
+            }
+            if (wsServer) {
+                auto endpoint_it = wsServer->endpoint.find(wsPath);
+                if (endpoint_it != wsServer->endpoint.end()) {
+                    auto &endpoint = endpoint_it->second;
+                    for (auto &conn : endpoint.get_connections()) {
+                        conn->send(json);
+                    }
+                }
+            }
+        }
+#endif
 
         // Small delay to prevent CPU overuse
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     // Cleanup
-    endwin();
+    
     running = false;
-    random_thread.join();
 
     return 0;
 }

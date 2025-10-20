@@ -1,6 +1,6 @@
 ## NodeFlow: Asynchronous Dataflow Framework
 
-NodeFlow is a C++ framework for creating and executing dataflow graphs with asynchronous nodes, designed to simulate real-time systems like device triggers. It compiles flows to standalone executables via LLVM for high performance and portability. The demo shows three async inputs (key1, key2, random1) whose values are summed in real-time using ncurses for keyboard input and a background random-number thread.
+NodeFlowLLVM is a C++ framework for creating and executing dataflow graphs with asynchronous nodes, designed to simulate real-time systems like device triggers. It compiles flows to standalone executables via LLVM for high performance and portability. The demo shows three async inputs (key1, key2, random1) whose values are summed in real-time using ncurses for keyboard input and an internal timer-driven random source.
 
 ### Key Features
 
@@ -9,6 +9,7 @@ NodeFlow is a C++ framework for creating and executing dataflow graphs with asyn
 - **Real-Time Updates**: Outputs update dynamically on key presses and on periodic random triggers.
 - **LLVM Compilation**: Generates optimized native code with a DSL-like `run_flow` entry point for easy integration.
 - **ncurses Integration**: Real-time keyboard input for interactive terminal applications.
+- **WebSocket Streaming (optional)**: Stream node updates and sums to a web UI via Simple-WebSocket-Server.
 
 ### Why LLVM + a DSL
 
@@ -42,7 +43,7 @@ brew install llvm ncurses nlohmann-json
 
 Note: On macOS, ncurses is provided by Homebrew. CMake links `${CURSES_LIBRARIES}` (typically under `/opt/homebrew/opt/ncurses` on Apple Silicon or `/usr/local/opt/ncurses` on Intel).
 
-#### Build
+#### Build (runtime + AOT enabled by default)
 
 ```bash
 mkdir build && cd build
@@ -56,23 +57,96 @@ cmake .. -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 make -j
 ```
 
-#### Run
+#### Run (runtime)
 
 ```bash
-./NodeFlowCore
+./NodeFlowCore --flow devicetrigger_addition.json
 ```
 
 - **Interact**: Press `1` or `2` to trigger `key1` (1.0) or `key2` (2.0). `random1` updates every 100–500 ms with a value in `[0, 100]`. Press `q` to quit.
 - **Output**: The ncurses UI shows the current sum and node statuses.
-- **Generated Executable**: The flow is compiled to `nodeflow_output` in the build directory and can be run independently: `./nodeflow_output`.
+
+### New: Command-line flags
+
+- `--flow <path>`: specify the flow JSON file. If omitted, defaults to `devicetrigger_addition.json` with fallback search in `.`/`..`/`../..`.
+- `--build-aot`: generate an AOT step-function library and exit. Files are named `<basename>_step.h/.cpp` (basename from the JSON filename).
+- `--out-dir <dir>`: when used with `--build-aot`, write generated files into the directory.
+- WebSockets (if enabled at build time with `-DNODEFLOW_WS_ENABLE=ON`):
+  - `--ws-enable`: enable WebSocket server (default on when WS is compiled in)
+  - `--ws-port <int>`: port (default 9002)
+  - `--ws-path <string>`: path (default `/stream`)
+  - `--ws-throttle-hz <int>`: max messages per second (default 20)
+
+Examples:
+
+```bash
+# Generate AOT-only artifacts (no runtime launch), writing to build/aot
+./NodeFlowCore --flow devicetrigger_addition.json --build-aot --out-dir build/aot
+```
+
+### AOT step library (Option B)
+
+When `--build-aot` is used, the engine emits a small, JSON-driven step-function interface:
+- `<basename>_step.h` defines:
+  - `NodeFlowInputs` (fields for each `DeviceTrigger` node)
+  - `NodeFlowOutputs` (fields for sink nodes)
+  - `nodeflow_step(const NodeFlowInputs*, NodeFlowOutputs*, NodeFlowState*)`
+- `<basename>_step.cpp` implements evaluation in topological order.
+
+Build integration:
+- CMake auto-builds any `*_step.cpp` in the source dir into a static library `build/lib<basename>_step.a`.
+- A minimal host example `<basename>_host` is built to demonstrate calling `nodeflow_step`.
+
+Usage:
+
+```bash
+# Build only AOT libs/hosts (no interactive runtime)
+cmake -S . -B build -DNODEFLOW_BUILD_RUNTIME=OFF && cmake --build build
+
+# Run host demo (fields depend on your flow; for the demo graph):
+./build/devicetrigger_addition_host --key1=1 --key2=2 --random1=3
+```
+
+### Runtime details
+
+- Non-blocking `DeviceTrigger` nodes: 
+  - Keyboard triggers update immediately on key press.
+  - Random trigger updates on internal per-node timers honoring JSON `min_interval`/`max_interval` (no external thread required).
+- Values persist between ticks; the sum updates when any input changes.
+- UI displays per-node values and both a calculated sum and the engine sum for verification.
+
+### WebSocket streaming + Web UI (optional)
+
+- Build with WS enabled:
+
+```bash
+cmake -S . -B build -DNODEFLOW_WS_ENABLE=ON && cmake --build build
+```
+
+- Run runtime with WS on and open the web client:
+
+```bash
+./build/NodeFlowCore --flow devicetrigger_addition.json --ws-enable
+# Then open web/index.html in your browser (connects to ws://127.0.0.1:9002/stream)
+```
+
+- The runtime broadcasts compact NDJSON-style JSON snapshots with current node values (key1, key2, random1) and `add1`.
+
+### Build options
+
+- `-DNODEFLOW_CODEGEN=ON|OFF` (default ON): include the demo standalone codegen (`nodeflow_output`).
+- `-DNODEFLOW_BUILD_RUNTIME=ON|OFF` (default ON): build the interactive runtime `NodeFlowCore`.
+- `-DNODEFLOW_WS_ENABLE=ON|OFF` (default OFF): enable WebSocket support in the runtime.
 
 ### Files
 
 - `devicetrigger_addition.json`: Defines the dataflow (two keyboard triggers, one random trigger, one add node).
 - `NodeFlowCore.hpp`: Core framework structures and interfaces.
 - `NodeFlowCore.cpp`: Node execution and LLVM compilation.
-- `main.cpp`: ncurses UI, random-number thread, JSON loading, and compilation step.
-- `CMakeLists.txt`: Build configuration for LLVM, nlohmann-json, and ncurses.
+- `main.cpp`: ncurses UI, JSON loading, optional WebSocket server, and codegen hooks.
+- `CMakeLists.txt`: Build configuration for nlohmann-json, ncurses, optional WS, and optional LLVM demo codegen.
+- `web/index.html`: Minimal WebSocket client to visualize live values.
+- `third_party/Simple-WebSocket-Server`: Header-only WebSocket server library (HTTP(S)/WS(S)) used for streaming.
 
 ### Notes & Troubleshooting
 

@@ -5,30 +5,72 @@
   <title>NodeFlow Stream</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
-    #vals { display: grid; grid-template-columns: repeat(2, 200px); gap: 8px 24px; align-items: center; }
-    .k { color: #555; }
-    .v { font-weight: 600; }
-    #log { margin-top: 16px; height: 160px; overflow: auto; background: #f7f7f7; padding: 8px; border-radius: 6px; }
+    .row { display: grid; grid-template-columns: 320px 200px; gap: 16px; align-items: center; margin: 8px 0; }
+    .label { color: #444; font-weight: 600; }
+    .ctrl { display: flex; align-items: center; gap: 12px; }
+    .val { font-weight: 700; min-width: 80px; text-align: right; }
+    #log { margin-top: 16px; height: 220px; overflow: auto; background: #0f172a; color: #e2e8f0; padding: 8px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .ts { color: #94a3b8; margin-right: 8px; }
   </style>
 </head>
 <body>
   <h2>NodeFlow Stream</h2>
   <div id="status">connecting…</div>
-  <div id="vals">
-    <div class="k">key1</div><div class="v" id="key1">-</div>
-    <div class="k">key2</div><div class="v" id="key2">-</div>
-    <div class="k">random1</div><div class="v" id="random1">-</div>
-    <div class="k">add1</div><div class="v" id="add1">-</div>
+  <div class="row">
+    <div class="ctrl">
+      <span class="label">key1</span>
+      <input type="checkbox" id="key1_cb">
+      <span>send 1.0 when checked</span>
+    </div>
+    <div class="val" id="key1_val">-</div>
+  </div>
+  <div class="row">
+    <div class="ctrl">
+      <span class="label">key2</span>
+      <input type="checkbox" id="key2_cb">
+      <span>send 2.0 when checked</span>
+    </div>
+    <div class="val" id="key2_val">-</div>
+  </div>
+  <div class="row">
+    <div class="ctrl" style="width:320px;">
+      <span class="label" style="min-width:48px;">random1</span>
+      <input type="range" id="random1_slider" min="0" max="100" step="1" style="width:220px;">
+      <span id="random1_send">0</span>
+    </div>
+    <div class="val" id="random1_val">-</div>
+  </div>
+  <div class="row">
+    <div class="ctrl"><span class="label">add1 (core)</span></div>
+    <div class="val" id="add1_val">-</div>
   </div>
   <div id="log"></div>
   <script>
     const statusEl = document.getElementById('status');
-    const vals = { key1: document.getElementById('key1'), key2: document.getElementById('key2'), random1: document.getElementById('random1'), add1: document.getElementById('add1') };
+    const el = {
+      key1_cb: document.getElementById('key1_cb'),
+      key2_cb: document.getElementById('key2_cb'),
+      random1_slider: document.getElementById('random1_slider'),
+      random1_send: document.getElementById('random1_send'),
+      key1_val: document.getElementById('key1_val'),
+      key2_val: document.getElementById('key2_val'),
+      random1_val: document.getElementById('random1_val'),
+      add1_val: document.getElementById('add1_val'),
+    };
     const logEl = document.getElementById('log');
 
+    function ts() {
+      const d = new Date();
+      return d.toLocaleTimeString([], {hour12:false}) + '.' + String(d.getMilliseconds()).padStart(3,'0');
+    }
     function log(s) {
       const d = document.createElement('div');
-      d.textContent = s;
+      const t = document.createElement('span');
+      t.className = 'ts';
+      t.textContent = '[' + ts() + ']';
+      const m = document.createElement('span');
+      m.textContent = ' ' + s;
+      d.appendChild(t); d.appendChild(m);
       logEl.appendChild(d);
       logEl.scrollTop = logEl.scrollHeight;
     }
@@ -44,10 +86,19 @@
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === 'snapshot') {
-            if ('key1' in msg) vals.key1.textContent = msg.key1.toFixed(3);
-            if ('key2' in msg) vals.key2.textContent = msg.key2.toFixed(3);
-            if ('random1' in msg) vals.random1.textContent = msg.random1.toFixed(3);
-            if ('add1' in msg) vals.add1.textContent = msg.add1.toFixed(3);
+            if ('key1' in msg) {
+              el.key1_val.textContent = msg.key1.toFixed(3);
+              el.key1_cb.checked = msg.key1 > 0.5;
+            }
+            if ('key2' in msg) {
+              el.key2_val.textContent = msg.key2.toFixed(3);
+              el.key2_cb.checked = msg.key2 > 1.0; // 2.0 when active
+            }
+            if ('random1' in msg) {
+              el.random1_val.textContent = msg.random1.toFixed(3);
+              // reflect slider softly
+            }
+            if ('add1' in msg) el.add1_val.textContent = msg.add1.toFixed(3);
           } else {
             log(ev.data);
           }
@@ -55,6 +106,31 @@
       };
     }
     connect();
+
+    function sendJSON(obj) {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+      else log('ws not ready');
+    }
+
+    // Controls → core
+    el.key1_cb.addEventListener('change', () => {
+      const value = el.key1_cb.checked ? 1.0 : 0.0;
+      sendJSON({ type: 'set', node: 'key1', value });
+      log(`set key1=${value}`);
+    });
+    el.key2_cb.addEventListener('change', () => {
+      const value = el.key2_cb.checked ? 2.0 : 0.0;
+      sendJSON({ type: 'set', node: 'key2', value });
+      log(`set key2=${value}`);
+    });
+    el.random1_slider.addEventListener('input', () => {
+      el.random1_send.textContent = el.random1_slider.value;
+    });
+    el.random1_slider.addEventListener('change', () => {
+      const value = Number(el.random1_slider.value);
+      sendJSON({ type: 'set', node: 'random1', value });
+      log(`set random1=${value}`);
+    });
   </script>
 </body>
 </html>

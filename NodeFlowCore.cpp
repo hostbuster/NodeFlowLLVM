@@ -24,13 +24,11 @@ void Node::execute(std::unordered_map<PortId, Value>& portValues) {
             }
         }
     } else if (type == "DeviceTrigger") {
-        // Non-blocking: if event ready, publish new value; otherwise reuse last output
+        // Headless: treat externally-set 'value' as the current output; no key polling
         if (parameters.count("key")) {
-            const std::string key = std::get<std::string>(parameters.at("key"));
-            const bool ready = isKeyPressed(key.c_str()) != 0;
             for (auto& output : outputs) {
                 Value newVal = output.value;
-                if (ready && parameters.count("value")) {
+                if (parameters.count("value")) {
                     const Value& p = parameters.at("value");
                     if (std::holds_alternative<float>(p)) newVal = std::get<float>(p);
                     else if (std::holds_alternative<double>(p)) newVal = static_cast<float>(std::get<double>(p));
@@ -40,12 +38,32 @@ void Node::execute(std::unordered_map<PortId, Value>& portValues) {
                 portValues[makeKey(output.id)] = newVal;
             }
         } else if (parameters.count("min_interval")) {
-            const int min = std::get<int>(parameters.at("min_interval"));
-            const int max = std::get<int>(parameters.at("max_interval"));
-            const bool ready = isRandomReady(min, max) != 0;
+            // Internal per-node random timer: non-blocking, updates when due
+            const int minMs = std::get<int>(parameters.at("min_interval"));
+            const int maxMs = std::get<int>(parameters.at("max_interval"));
+            using Clock = std::chrono::steady_clock;
+            static std::unordered_map<std::string, Clock::time_point> nodeIdToNextDue;
+            static std::mt19937 rng(std::random_device{}());
+            static std::unordered_map<std::string, std::uniform_int_distribution<int>> nodeIdToInterval;
+            static std::uniform_real_distribution<float> valueDist(0.0f, 100.0f);
+
+            auto now = Clock::now();
+            auto itDue = nodeIdToNextDue.find(id);
+            if (itDue == nodeIdToNextDue.end()) {
+                nodeIdToInterval.emplace(id, std::uniform_int_distribution<int>(minMs, maxMs));
+                auto delta = std::chrono::milliseconds(nodeIdToInterval[id](rng));
+                nodeIdToNextDue[id] = now + delta;
+            }
+
+            bool ready = now >= nodeIdToNextDue[id];
+            if (ready) {
+                auto delta = std::chrono::milliseconds(nodeIdToInterval[id](rng));
+                nodeIdToNextDue[id] = now + delta;
+            }
+
             for (auto& output : outputs) {
                 Value newVal = output.value;
-                if (ready) newVal = static_cast<float>(getRandomNumber());
+                if (ready) newVal = valueDist(rng);
                 output.value = newVal;
                 portValues[makeKey(output.id)] = newVal;
             }
@@ -239,7 +257,7 @@ void FlowEngine::execute() {
     for (const auto& nodeId : executionOrder) {
         auto it = std::find_if(nodes.begin(), nodes.end(), [&](const Node& n) { return n.id == nodeId; });
         if (it == nodes.end()) continue;
-        it->execute(portValues);
+            it->execute(portValues);
         // Propagate fresh outputs from this node
         for (const auto& out : it->outputs) {
             auto outKey = makeKey(it->id, out.id);
@@ -344,3 +362,108 @@ void FlowEngine::compileToExecutable(const std::string& outputFile, bool /*dslMo
 }
 
 } // namespace NodeFlow
+ 
+void NodeFlow::FlowEngine::setNodeValue(const std::string& nodeId, float value) {
+    auto it = std::find_if(nodes.begin(), nodes.end(), [&](const Node& n){ return n.id == nodeId; });
+    if (it == nodes.end()) return;
+    it->parameters["value"] = static_cast<float>(value);
+    for (auto &out : it->outputs) out.value = static_cast<float>(value);
+}
+
+void NodeFlow::FlowEngine::setNodeConfigMinMax(const std::string& nodeId, int minIntervalMs, int maxIntervalMs) {
+    auto it = std::find_if(nodes.begin(), nodes.end(), [&](const Node& n){ return n.id == nodeId; });
+    if (it == nodes.end()) return;
+    it->parameters["min_interval"] = minIntervalMs;
+    it->parameters["max_interval"] = maxIntervalMs;
+}
+
+// Generate a small step-function library: <baseName>_step.h/.cpp
+void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) const {
+    const std::string headerPath = baseName + "_step.h";
+    const std::string sourcePath = baseName + "_step.cpp";
+    std::ofstream h(headerPath), c(sourcePath);
+    if (!h.is_open() || !c.is_open()) return;
+
+    auto getBaseType = [](const std::string& t) {
+        return t.rfind("async_", 0) == 0 ? t.substr(6) : t;
+    };
+    auto toCType = [&](const std::string& t) -> std::string {
+        const auto bt = getBaseType(t);
+        if (bt == "int") return "int";
+        if (bt == "double") return "double";
+        return "float";
+    };
+
+    // Inputs: all DeviceTrigger nodes
+    std::vector<const Node*> inputNodes;
+    for (const auto& n : nodes) {
+        if (n.type == "DeviceTrigger" && !n.outputs.empty()) inputNodes.push_back(&n);
+    }
+    // Sinks: nodes with no outgoing edges
+    std::vector<const Node*> sinkNodes;
+    for (const auto& n : nodes) {
+        bool hasOut = false;
+        for (const auto& cc : connections) { if (cc.fromNode == n.id) { hasOut = true; break; } }
+        if (!hasOut && !n.outputs.empty()) sinkNodes.push_back(&n);
+    }
+    if (sinkNodes.empty()) for (const auto& n : nodes) if (!n.outputs.empty()) sinkNodes.push_back(&n);
+
+    // Header
+    h << "#pragma once\n";
+    h << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
+    h << "typedef struct {\n";
+    for (const auto* n : inputNodes) h << "  " << toCType(n->outputs[0].dataType) << " " << n->id << ";\n";
+    h << "} NodeFlowInputs;\n";
+    h << "typedef struct {\n";
+    for (const auto* n : sinkNodes) h << "  " << toCType(n->outputs[0].dataType) << " " << n->id << ";\n";
+    h << "} NodeFlowOutputs;\n";
+    h << "typedef struct {\n";
+    h << "} NodeFlowState;\n";
+    h << "void nodeflow_step(const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* state);\n";
+    h << "#ifdef __cplusplus\n}\n#endif\n";
+    h.close();
+
+    auto findNodeById = [&](const std::string& id) -> const Node* {
+        for (const auto& n : nodes) if (n.id == id) return &n; return nullptr;
+    };
+
+    c << "#include \"" << headerPath << "\"\n";
+    c << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
+    c << "void nodeflow_step(const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState*) {\n";
+    // Temp vars for node outputs
+    for (const auto& n : nodes) if (!n.outputs.empty()) c << "  " << toCType(n.outputs[0].dataType) << " _" << n.id << " = 0;\n";
+    c << "\n";
+    // Execute in topo order
+    for (const auto& nodeId : executionOrder) {
+        const Node* n = findNodeById(nodeId);
+        if (!n || n->outputs.empty()) continue;
+        std::string outVar = std::string("_") + n->id;
+        if (n->type == "DeviceTrigger") {
+            c << "  " << outVar << " = in->" << n->id << ";\n";
+        } else if (n->type == "Value") {
+            double dv = 0.0;
+            auto it = n->parameters.find("value");
+            if (it != n->parameters.end()) {
+                if (std::holds_alternative<int>(it->second)) dv = static_cast<double>(std::get<int>(it->second));
+                else if (std::holds_alternative<float>(it->second)) dv = static_cast<double>(std::get<float>(it->second));
+                else if (std::holds_alternative<double>(it->second)) dv = std::get<double>(it->second);
+            }
+            c << "  " << outVar << " = (" << dv << ");\n";
+        } else if (n->type == "Add") {
+            std::vector<std::string> src;
+            for (const auto& inP : n->inputs) {
+                for (const auto& cc : connections) if (cc.toNode == n->id && cc.toPort == inP.id) { src.push_back(std::string("_") + cc.fromNode); break; }
+            }
+            if (src.empty()) src.push_back("0");
+            c << "  " << outVar << " = ";
+            for (size_t i = 0; i < src.size(); ++i) { if (i) c << " + "; c << src[i]; }
+            c << ";\n";
+        }
+    }
+    c << "\n";
+    // Write sinks
+    for (const auto* sn : sinkNodes) c << "  out->" << sn->id << " = _" << sn->id << ";\n";
+    c << "}\n";
+    c << "#ifdef __cplusplus\n}\n#endif\n";
+    c.close();
+}
