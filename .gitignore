@@ -1,0 +1,69 @@
+# Build directories and CMake artifacts
+/build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+compile_commands.json
+
+# Compiled objects, libraries, executables
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# Generated binaries and demo outputs
+/nodeflow_output
+/nodeflow_output.exe
+/nodeflow_output.cpp
+/NodeFlowCore
+
+# AOT generated step files (emit into repo root or out-dir)
+*_step.h
+*_step.cpp
+/build/*.a
+/build/*.lib
+/build/*_host
+
+# Logs, coverage, debug
+*.log
+*.gcno
+*.gcda
+*.gcov
+*.dSYM/
+
+# Editor/OS junk
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Editor/IDE config
+.vscode/
+.idea/
+*.code-workspace
+.ccls-cache/
+.clangd/
+.cache/
+
+# Swap/backup files
+*~
+*.swp
+*.swo
+*.tmp
+
+# Python/node (if present)
+.venv/
+node_modules/

@@ -65,28 +65,7 @@ int main(int argc, char** argv) {
     }
     engine.loadFromJson(json);
 
-    // Resolve random trigger intervals from JSON (fallback to defaults)
-    int rand_min_ms = 100;
-    int rand_max_ms = 500;
-    try {
-        if (json.contains("nodes") && json["nodes"].is_array()) {
-            for (const auto& n : json["nodes"]) {
-                if (n.contains("type") && n["type"].is_string() && n["type"].get<std::string>() == "DeviceTrigger") {
-                    if (n.contains("parameters") && n["parameters"].is_object()) {
-                        const auto& p = n["parameters"];
-                        if (p.contains("min_interval") && p["min_interval"].is_number_integer()) {
-                            rand_min_ms = p["min_interval"].get<int>();
-                        }
-                        if (p.contains("max_interval") && p["max_interval"].is_number_integer()) {
-                            rand_max_ms = p["max_interval"].get<int>();
-                        }
-                    }
-                }
-            }
-        }
-    } catch (...) {
-        // keep defaults
-    }
+    // No random interval parsing here; inputs are driven externally via IPC
 
     // AOT generation (Option B) using flow basename
     if (buildAOT) {
@@ -123,6 +102,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<WsServer> wsServer;
     std::thread wsThread;
     std::mutex wsMutex;
+    std::mutex engineMutex;
     std::string latestJson; // last snapshot/delta, for simple demo
     {
         wsServer = std::make_unique<WsServer>();
@@ -133,6 +113,70 @@ int main(int argc, char** argv) {
         if (wsPattern.empty() || wsPattern.front() != '^') wsPattern = "^" + wsPattern + "$";
 
         auto &ep = wsServer->endpoint[wsPattern];
+
+        auto buildSchema = [&]() {
+            const auto &nodes = engine.getNodeDescs();
+            const auto &ports = engine.getPortDescs();
+            std::string s;
+            s += "{\"type\":\"schema\",";
+            s += "\"nodes\":[";
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                const auto &n = nodes[i];
+                if (i) s += ",";
+                s += "{\"id\":\"" + n.id + "\",\"type\":\"" + n.type + "\"}";
+            }
+            s += "],";
+            s += "\"ports\":[";
+            for (size_t i = 0; i < ports.size(); ++i) {
+                const auto &p = ports[i];
+                if (i) s += ",";
+                s += "{\"handle\":" + std::to_string(p.handle)
+                   + ",\"nodeId\":\"" + p.nodeId + "\""
+                   + ",\"portId\":\"" + p.portId + "\""
+                   + ",\"direction\":\"" + p.direction + "\""
+                   + ",\"dtype\":\"" + p.dataType + "\"}";
+            }
+            s += "]}\n";
+            return s;
+        };
+
+        auto valueToJson = [](const NodeFlow::Value &v) -> std::string {
+            if (std::holds_alternative<float>(v)) return fmt::format("{:.3f}", std::get<float>(v));
+            if (std::holds_alternative<double>(v)) return fmt::format("{:.3f}", std::get<double>(v));
+            if (std::holds_alternative<int>(v)) return fmt::format("{}", std::get<int>(v));
+            if (std::holds_alternative<std::string>(v)) {
+                const auto &s = std::get<std::string>(v);
+                std::string esc; esc.reserve(s.size()+2);
+                esc.push_back('"');
+                for (char c : s) { if (c=='"' || c=='\\') esc.push_back('\\'); esc.push_back(c);} 
+                esc.push_back('"');
+                return esc;
+            }
+            return "null";
+        };
+
+        auto buildSnapshot = [&]() {
+            std::lock_guard<std::mutex> engLock(engineMutex);
+            engine.execute();
+            std::string js = "{\"type\":\"snapshot\"";
+            const auto &ports = engine.getPortDescs();
+            // count outputs per node
+            std::unordered_map<std::string,int> outCount;
+            for (const auto &p : ports) if (p.direction == "output") ++outCount[p.nodeId];
+            for (const auto &p : ports) {
+                if (p.direction != "output") continue;
+                auto val = engine.readPort(p.handle);
+                // canonical key
+                js += ",\""; js += p.nodeId; js += ":"; js += p.portId; js += "\":";
+                js += valueToJson(val);
+                // alias for single-output nodes to keep existing UI working (nodeId only)
+                if (outCount[p.nodeId] == 1) {
+                    js += ",\""; js += p.nodeId; js += "\":"; js += valueToJson(val);
+                }
+            }
+            js += "}\n";
+            return js;
+        };
 
         ep.on_message = [&, wsPattern](auto conn, auto msg){
             try {
@@ -159,52 +203,62 @@ int main(int argc, char** argv) {
                     auto s = data.substr(p+1, (q==std::string::npos?data.size():q) - (p+1));
                     return std::atof(s.c_str());
                 };
+                auto hasKey = [&](const char* key){
+                    auto p = data.find(std::string("\"") + key + "\"");
+                    if (p == std::string::npos) return false;
+                    p = data.find(':', p);
+                    return p != std::string::npos;
+                };
                 auto type = getStr("type");
                 auto broadcastSnapshot = [&](){
-                    engine.execute();
-                    auto outs = engine.getOutputs();
-                    auto getF = [&](const char* id){
-                        auto it = outs.find(id);
-                        if (it == outs.end() || it->second.empty()) return 0.0f;
-                        const auto &v = it->second[0];
-                        if (std::holds_alternative<float>(v)) return std::get<float>(v);
-                        if (std::holds_alternative<double>(v)) return static_cast<float>(std::get<double>(v));
-                        if (std::holds_alternative<int>(v)) return static_cast<float>(std::get<int>(v));
-                        return 0.0f;
-                    };
-                    char buf[256];
-                    int n = std::snprintf(buf, sizeof(buf),
-                        "{\"type\":\"snapshot\",\"key1\":%.3f,\"key2\":%.3f,\"random1\":%.3f,\"add1\":%.3f}\n",
-                        getF("key1"), getF("key2"), getF("random1"), getF("add1"));
-                    std::string json(buf, n > 0 ? (size_t)n : 0);
+                    std::string snap = buildSnapshot();
                     {
                         std::lock_guard<std::mutex> lock(wsMutex);
-                        latestJson = json;
+                        latestJson = snap;
                     }
                     auto it_ep = wsServer->endpoint.find(wsPattern);
                     if (it_ep != wsServer->endpoint.end()) {
                         for (auto &c2 : it_ep->second.get_connections()) {
-                            c2->send(json);
+                            c2->send(snap);
                         }
                     }
                 };
                 if (type == "set") {
-                    auto node = getStr("node");
                     float value = static_cast<float>(getNum("value"));
-                    engine.setNodeValue(node, value);
+                    if (hasKey("handle")) {
+                        int handle = static_cast<int>(getNum("handle"));
+                        const auto &ports = engine.getPortDescs();
+                        if (handle >= 0 && static_cast<size_t>(handle) < ports.size()) {
+                            const auto &pd = ports[handle];
+                            // For device inputs/outputs, set node value
+                            {
+                                std::lock_guard<std::mutex> engLock2(engineMutex);
+                                engine.setNodeValue(pd.nodeId, value);
+                            }
+                        }
+                    } else {
+                        auto node = getStr("node");
+                        {
+                            std::lock_guard<std::mutex> engLock3(engineMutex);
+                            engine.setNodeValue(node, value);
+                        }
+                    }
                     conn->send("{\"ok\":true}\n");
                     broadcastSnapshot();
                 } else if (type == "config") {
                     auto node = getStr("node");
                     int minI = static_cast<int>(getNum("min_interval"));
                     int maxI = static_cast<int>(getNum("max_interval"));
-                    engine.setNodeConfigMinMax(node, minI, maxI);
+                    {
+                        std::lock_guard<std::mutex> engLock4(engineMutex);
+                        engine.setNodeConfigMinMax(node, minI, maxI);
+                    }
                     conn->send("{\"ok\":true}\n");
                     broadcastSnapshot();
                 } else if (type == "reload") {
                     auto path = getStr("flow");
                     std::ifstream f(path);
-                    if (f.good()) { nlohmann::json j; f >> j; engine.loadFromJson(j); conn->send("{\"ok\":true}\n"); broadcastSnapshot(); }
+                    if (f.good()) { nlohmann::json j; f >> j; { std::lock_guard<std::mutex> engLock5(engineMutex); engine.loadFromJson(j); } conn->send("{\"ok\":true}\n"); broadcastSnapshot(); }
                     else conn->send("{\"ok\":false}\n");
                 } else if (type == "subscribe") {
                     conn->send("{\"ok\":true}\n");
@@ -218,6 +272,10 @@ int main(int argc, char** argv) {
 
         ep.on_open = [&](auto conn){
             std::lock_guard<std::mutex> lock(wsMutex);
+            try {
+                auto schema = buildSchema();
+                conn->send(schema);
+            } catch(...) {}
             if (!latestJson.empty()) conn->send(latestJson);
             fmt::print("client connected\n");
         };
@@ -226,57 +284,78 @@ int main(int argc, char** argv) {
         wsThread = std::thread([&]{ wsServer->start(); });
     }
 
-    // Main loop: Run flow and update display
-    float last_sum = -9999.0f;
+    // Main loop: Run flow and broadcast generic snapshots and deltas
+    NodeFlow::Generation lastSnapshotGen = 0;
     while (running) {
         engine.execute();
-        auto outputs = engine.getOutputs();
-        auto getFloat = [&](const std::string& nodeId) -> float {
-            if (!outputs.count(nodeId) || outputs[nodeId].empty()) return 0.0f;
-            const auto& v = outputs[nodeId][0];
-            if (std::holds_alternative<float>(v)) return std::get<float>(v);
-            if (std::holds_alternative<double>(v)) return static_cast<float>(std::get<double>(v));
-            if (std::holds_alternative<int>(v)) return static_cast<float>(std::get<int>(v));
-            return 0.0f;
+        auto valueToJsonLoop = [](const NodeFlow::Value &v) -> std::string {
+            if (std::holds_alternative<float>(v)) return fmt::format("{:.3f}", std::get<float>(v));
+            if (std::holds_alternative<double>(v)) return fmt::format("{:.3f}", std::get<double>(v));
+            if (std::holds_alternative<int>(v)) return fmt::format("{}", std::get<int>(v));
+            if (std::holds_alternative<std::string>(v)) {
+                const auto &s = std::get<std::string>(v);
+                std::string esc; esc.reserve(s.size()+2);
+                esc.push_back('"');
+                for (char c : s) { if (c=='"' || c=='\\') esc.push_back('\\'); esc.push_back(c);} 
+                esc.push_back('"');
+                return esc;
+            }
+            return "null";
         };
 
-        float key1_val = getFloat("key1");
-        float key2_val = getFloat("key2");
-        float random_val = getFloat("random1");
-        float engine_sum = 0.0f;
-        if (outputs.count("add1") && !outputs["add1"].empty()) {
-            const auto& v = outputs["add1"][0];
-            engine_sum = std::holds_alternative<float>(v) ? std::get<float>(v)
-                        : std::holds_alternative<double>(v) ? static_cast<float>(std::get<double>(v))
-                        : std::holds_alternative<int>(v) ? static_cast<float>(std::get<int>(v))
-                        : 0.0f;
+        std::string jsonOut = "{\"type\":\"snapshot\"";
+        const auto &portsOut = engine.getPortDescs();
+        std::unordered_map<std::string,int> outCount2;
+        for (const auto &p : portsOut) if (p.direction == "output") ++outCount2[p.nodeId];
+        for (const auto &p : portsOut) {
+            if (p.direction != "output") continue;
+            auto v = engine.readPort(p.handle);
+            jsonOut += ",\""; jsonOut += p.nodeId; jsonOut += ":"; jsonOut += p.portId; jsonOut += "\":";
+            jsonOut += valueToJsonLoop(v);
+            if (outCount2[p.nodeId] == 1) {
+                jsonOut += ",\""; jsonOut += p.nodeId; jsonOut += "\":"; jsonOut += valueToJsonLoop(v);
+            }
         }
-        float calc_sum = key1_val + key2_val + random_val;
-
-        // Update display only if sum changes
-        if (calc_sum != last_sum) {
-            last_sum = calc_sum;
-        }
+        jsonOut += "}\n";
 
         {
-            // Emit a compact JSON snapshot for the demo
-            std::string json = fmt::format(
-                "{{\"type\":\"snapshot\",\"key1\":{:.3f},\"key2\":{:.3f},\"random1\":{:.3f},\"add1\":{:.3f}}}\n",
-                key1_val, key2_val, random_val, engine_sum);
-            {
-                std::lock_guard<std::mutex> lock(wsMutex);
-                latestJson = json;
+            std::lock_guard<std::mutex> lock(wsMutex);
+            latestJson = jsonOut;
+        }
+        if (wsServer) {
+            auto endpoint_it = wsServer->endpoint.find(wsPath);
+            if (endpoint_it != wsServer->endpoint.end()) {
+                auto &endpoint = endpoint_it->second;
+                for (auto &conn : endpoint.get_connections()) {
+                    conn->send(jsonOut);
+                }
             }
+        }
+
+        // Delta emission using generation counters (per-port)
+        auto snapGen = engine.beginSnapshot();
+        auto deltas = engine.getPortDeltasChangedSince(lastSnapshotGen);
+        if (!deltas.empty()) {
+            std::string delta = "{\"type\":\"delta\"";
+            for (const auto &t : deltas) {
+                const auto &nodeId = std::get<0>(t);
+                const auto &portId = std::get<1>(t);
+                const auto &val = std::get<2>(t);
+                delta += ",\""; delta += nodeId; delta += ":"; delta += portId; delta += "\":";
+                delta += valueToJsonLoop(val);
+            }
+            delta += "}\n";
             if (wsServer) {
-                auto endpoint_it = wsServer->endpoint.find(wsPath);
-                if (endpoint_it != wsServer->endpoint.end()) {
-                    auto &endpoint = endpoint_it->second;
-                    for (auto &conn : endpoint.get_connections()) {
-                        conn->send(json);
+                auto endpoint_it2 = wsServer->endpoint.find(wsPath);
+                if (endpoint_it2 != wsServer->endpoint.end()) {
+                    auto &endpoint2 = endpoint_it2->second;
+                    for (auto &conn : endpoint2.get_connections()) {
+                        conn->send(delta);
                     }
                 }
             }
         }
+        lastSnapshotGen = snapGen;
 
         // Small delay to prevent CPU overuse
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

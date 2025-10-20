@@ -7,8 +7,8 @@
 #include <thread>
 #include <random>
 #include <ctime>
-#include <ncurses.h>
-#include <pthread.h>
+#include <iostream>
+// headless-only; remove legacy TUI includes
 
 namespace NodeFlow {
 
@@ -146,6 +146,13 @@ void FlowEngine::loadFromJson(const nlohmann::json& json) {
     srand(time(NULL));
     nodes.clear();
     connections.clear();
+    nodeDescs.clear();
+    portDescs.clear();
+    portKeyToHandle.clear();
+    portChangedStamp.clear();
+    portValues.clear();
+    outToIn.clear();
+    nodeOutputHandles.clear();
 
     for (const auto& nodeJson : json["nodes"]) {
         Node node;
@@ -173,7 +180,43 @@ void FlowEngine::loadFromJson(const nlohmann::json& json) {
                 }
             }
         }
+        // Build descriptors and handles as we go
+        NodeDesc nd; nd.id = node.id; nd.type = node.type;
+        for (const auto& ip : node.inputs) {
+            std::string key = node.id + ":" + ip.id + ":input";
+            PortHandle h = static_cast<PortHandle>(portDescs.size());
+            portKeyToHandle[key] = h;
+            portDescs.push_back({h, node.id, ip.id, "input", ip.dataType});
+            portChangedStamp.push_back(0);
+            nd.inputPorts.push_back(h);
+        }
+        for (const auto& op : node.outputs) {
+            std::string key = node.id + ":" + op.id + ":output";
+            PortHandle h = static_cast<PortHandle>(portDescs.size());
+            portKeyToHandle[key] = h;
+            portDescs.push_back({h, node.id, op.id, "output", op.dataType});
+            portChangedStamp.push_back(0);
+            nd.outputPorts.push_back(h);
+        }
+        nodeDescs.push_back(std::move(nd));
         nodes.push_back(node);
+    }
+    portValues.resize(portDescs.size());
+    outToIn.resize(portDescs.size());
+
+    // Build handle adjacency and node->output handles map
+    for (const auto &n : nodes) {
+        std::vector<PortHandle> outs;
+        for (const auto &op : n.outputs) {
+            int h = getPortHandle(n.id, op.id, "output");
+            if (h >= 0) outs.push_back(h);
+        }
+        nodeOutputHandles[n.id] = std::move(outs);
+    }
+    for (const auto &c : connections) {
+        int hOut = getPortHandle(c.fromNode, c.fromPort, "output");
+        int hIn  = getPortHandle(c.toNode, c.toPort, "input");
+        if (hOut >= 0 && hIn >= 0) outToIn[hOut].push_back(hIn);
     }
 
     for (const auto& connJson : json["connections"]) {
@@ -197,6 +240,31 @@ void FlowEngine::loadFromJson(const nlohmann::json& json) {
     }
 
     computeExecutionOrder();
+
+    // Rebuild handle adjacency now that connections are populated
+    outToIn.clear();
+    outToIn.resize(portDescs.size());
+    nodeOutputHandles.clear();
+    for (const auto &n : nodes) {
+        std::vector<PortHandle> outs;
+        for (const auto &op : n.outputs) {
+            int h = getPortHandle(n.id, op.id, "output");
+            if (h >= 0) outs.push_back(h);
+        }
+        nodeOutputHandles[n.id] = std::move(outs);
+    }
+    for (const auto &c : connections) {
+        int hOut = getPortHandle(c.fromNode, c.fromPort, "output");
+        int hIn  = getPortHandle(c.toNode, c.toPort, "input");
+        if (hOut >= 0 && hIn >= 0) outToIn[hOut].push_back(hIn);
+        std::cout << "[DEBUG] connect " << c.fromNode << ":" << c.fromPort << "(hOut=" << hOut << ") -> "
+                  << c.toNode << ":" << c.toPort << "(hIn=" << hIn << ")\n";
+    }
+}
+int FlowEngine::getPortHandle(const std::string& nodeId, const std::string& portId, const std::string& direction) const {
+    auto it = portKeyToHandle.find(nodeId + ":" + portId + ":" + direction);
+    if (it == portKeyToHandle.end()) return -1;
+    return it->second;
 }
 
 void FlowEngine::computeExecutionOrder() {
@@ -234,42 +302,302 @@ void FlowEngine::computeExecutionOrder() {
     if (executionOrder.size() != nodes.size()) {
         throw std::runtime_error("Cycle detected in flow graph");
     }
+
+    // Build topo index and dependents
+    topoIndex.clear();
+    dependents = graph;
+    for (size_t i = 0; i < executionOrder.size(); ++i) topoIndex[executionOrder[i]] = static_cast<int>(i);
 }
 
 void FlowEngine::execute() {
-    std::unordered_map<PortId, Value> portValues;
+    // bump evaluation generation
+    ++evalGeneration;
+
+    std::unordered_map<PortId, Value> portMap;
     auto makeKey = [](const std::string& nodeId, const std::string& portId) { return nodeId + ":" + portId; };
     // Seed with last outputs so downstream consumers see previous values if no new events
     for (const auto& node : nodes) {
         for (const auto& output : node.outputs) {
-            portValues[makeKey(node.id, output.id)] = output.value;
+            portMap[makeKey(node.id, output.id)] = output.value;
+            int hOut = getPortHandle(node.id, output.id, "output");
+            if (hOut >= 0 && static_cast<size_t>(hOut) < portValues.size()) this->portValues[hOut] = output.value;
         }
     }
-    // Initial propagation
-    for (const auto& conn : connections) {
-        auto fromKey = makeKey(conn.fromNode, conn.fromPort);
-        auto toKey = makeKey(conn.toNode, conn.toPort);
-        if (portValues.count(fromKey)) {
-            portValues[toKey] = portValues[fromKey];
-        }
-    }
-    // Execute nodes in order; after each node, propagate its outputs to consumers
-    for (const auto& nodeId : executionOrder) {
-        auto it = std::find_if(nodes.begin(), nodes.end(), [&](const Node& n) { return n.id == nodeId; });
-        if (it == nodes.end()) continue;
-            it->execute(portValues);
-        // Propagate fresh outputs from this node
-        for (const auto& out : it->outputs) {
-            auto outKey = makeKey(it->id, out.id);
-            portValues[outKey] = out.value;
-            for (const auto& conn : connections) {
-                if (conn.fromNode == it->id && conn.fromPort == out.id) {
-                    auto toKey = makeKey(conn.toNode, conn.toPort);
-                    portValues[toKey] = out.value;
-                }
+    // Initial propagation via handle adjacency
+    for (const auto &pd : portDescs) {
+        if (pd.direction != "output") continue;
+        int hOut = pd.handle;
+        for (int hIn : outToIn[hOut]) {
+            if (hIn >= 0 && static_cast<size_t>(hIn) < portValues.size()) {
+                this->portValues[hIn] = this->portValues[hOut];
+                const auto &pin = portDescs[hIn];
+                portMap[makeKey(pin.nodeId, pin.portId)] = this->portValues[hIn];
             }
         }
     }
+    // Helper to process a single node: execute, propagate, mark changes and enqueue dependents
+    auto processNode = [&](const NodeId& nodeId) {
+        auto it = std::find_if(nodes.begin(), nodes.end(), [&](const Node& n) { return n.id == nodeId; });
+        if (it == nodes.end()) return;
+        // Capture previous first-output value for change detection
+        Value prevOut0;
+        bool hasPrev0 = false;
+        if (!it->outputs.empty()) {
+            auto key0 = makeKey(it->id, it->outputs[0].id);
+            auto pvIt = portMap.find(key0);
+            if (pvIt != portMap.end()) { prevOut0 = pvIt->second; hasPrev0 = true; }
+        }
+        // Handle-based execution for common node types (Value, DeviceTrigger, Add)
+        bool handled = false;
+        if (it->type == "Value") {
+            Value v = 0.0f;
+            auto p = it->parameters.find("value");
+            if (p != it->parameters.end()) v = p->second;
+            for (auto &op : it->outputs) {
+                op.value = v;
+                auto outKey = makeKey(it->id, op.id);
+                portMap[outKey] = v;
+                int hOut = getPortHandle(it->id, op.id, "output");
+                if (hOut >= 0 && (size_t)hOut < portValues.size()) {
+                    this->portValues[hOut] = v;
+                    if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                    for (int hIn : outToIn[hOut]) {
+                        if (hIn >= 0 && (size_t)hIn < portValues.size()) {
+                            this->portValues[hIn] = v;
+                            const auto &pin = portDescs[hIn];
+                            portMap[makeKey(pin.nodeId, pin.portId)] = v;
+                        }
+                    }
+                }
+            }
+            handled = true;
+        } else if (it->type == "DeviceTrigger") {
+            // Use last set value (parameters["value"]) or keep current outputs
+            Value vOut;
+            bool have = false;
+            auto p = it->parameters.find("value");
+            if (p != it->parameters.end()) { vOut = p->second; have = true; }
+            for (auto &op : it->outputs) {
+                if (have) op.value = vOut;
+                auto outKey = makeKey(it->id, op.id);
+                portMap[outKey] = op.value;
+                int hOut = getPortHandle(it->id, op.id, "output");
+                if (hOut >= 0 && (size_t)hOut < portValues.size()) {
+                    this->portValues[hOut] = op.value;
+                    if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                    for (int hIn : outToIn[hOut]) {
+                        if (hIn >= 0 && (size_t)hIn < portValues.size()) {
+                            this->portValues[hIn] = op.value;
+                            const auto &pin = portDescs[hIn];
+                            portMap[makeKey(pin.nodeId, pin.portId)] = op.value;
+                        }
+                    }
+                }
+            }
+            handled = true;
+        } else if (it->type == "Add") {
+            if (!it->outputs.empty()) {
+                const std::string &dtype = it->outputs[0].dataType;
+                auto baseType = [&](const std::string &t){ return t.rfind("async_", 0) == 0 ? t.substr(6) : t; };
+                std::string bt = baseType(dtype);
+                if (bt == "int") {
+                    int sum = 0;
+                    std::string dbg = "inputs:";
+                    for (const auto &ip : it->inputs) {
+                        int v = 0;
+                        int hIn = getPortHandle(it->id, ip.id, "input");
+                        if (hIn >= 0 && (size_t)hIn < portValues.size()) {
+                            const Value &vv = this->portValues[hIn];
+                            if (std::holds_alternative<int>(vv)) v = std::get<int>(vv);
+                            else if (std::holds_alternative<float>(vv)) v = (int)std::get<float>(vv);
+                            else if (std::holds_alternative<double>(vv)) v = (int)std::get<double>(vv);
+                        } else {
+                            // Fallback via connections map
+                            for (const auto &cc : connections) if (cc.toNode == it->id && cc.toPort == ip.id) {
+                                auto outKey2 = makeKey(cc.fromNode, cc.fromPort);
+                                auto itv = portMap.find(outKey2);
+                                if (itv != portMap.end()) {
+                                    const Value &vv = itv->second;
+                                    if (std::holds_alternative<int>(vv)) v = std::get<int>(vv);
+                                    else if (std::holds_alternative<float>(vv)) v = (int)std::get<float>(vv);
+                                    else if (std::holds_alternative<double>(vv)) v = (int)std::get<double>(vv);
+                                }
+                                break;
+                            }
+                        }
+                        sum += v;
+                        dbg += " " + std::to_string(v);
+                    }
+                    
+                    for (auto &op : it->outputs) {
+                        op.value = sum;
+                        auto outKey = makeKey(it->id, op.id);
+                        portMap[outKey] = sum;
+                        int hOut = getPortHandle(it->id, op.id, "output");
+                        if (hOut >= 0 && (size_t)hOut < portValues.size()) {
+                            this->portValues[hOut] = sum;
+                            if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                            for (int hIn : outToIn[hOut]) {
+                                if (hIn >= 0 && (size_t)hIn < portValues.size()) {
+                                    this->portValues[hIn] = sum;
+                                    const auto &pin = portDescs[hIn];
+                                    portMap[makeKey(pin.nodeId, pin.portId)] = sum;
+                                }
+                            }
+                        }
+                    }
+                } else if (bt == "double") {
+                    double sum = 0.0;
+                    std::string dbg = "inputs:";
+                    for (const auto &ip : it->inputs) {
+                        double v = 0.0;
+                        int hIn = getPortHandle(it->id, ip.id, "input");
+                        if (hIn >= 0 && (size_t)hIn < portValues.size()) {
+                            const Value &vv = this->portValues[hIn];
+                            if (std::holds_alternative<double>(vv)) v = std::get<double>(vv);
+                            else if (std::holds_alternative<float>(vv)) v = (double)std::get<float>(vv);
+                            else if (std::holds_alternative<int>(vv)) v = (double)std::get<int>(vv);
+                        } else {
+                            for (const auto &cc : connections) if (cc.toNode == it->id && cc.toPort == ip.id) {
+                                auto outKey2 = makeKey(cc.fromNode, cc.fromPort);
+                                auto itv = portMap.find(outKey2);
+                                if (itv != portMap.end()) {
+                                    const Value &vv = itv->second;
+                                    if (std::holds_alternative<double>(vv)) v = std::get<double>(vv);
+                                    else if (std::holds_alternative<float>(vv)) v = (double)std::get<float>(vv);
+                                    else if (std::holds_alternative<int>(vv)) v = (double)std::get<int>(vv);
+                                }
+                                break;
+                            }
+                        }
+                        sum += v;
+                        dbg += " " + std::to_string(v);
+                    }
+                    
+                    for (auto &op : it->outputs) {
+                        op.value = sum;
+                        auto outKey = makeKey(it->id, op.id);
+                        portMap[outKey] = sum;
+                        int hOut = getPortHandle(it->id, op.id, "output");
+                        if (hOut >= 0 && (size_t)hOut < portValues.size()) {
+                            this->portValues[hOut] = sum;
+                            if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                            for (int hIn : outToIn[hOut]) {
+                                if (hIn >= 0 && (size_t)hIn < portValues.size()) {
+                                    this->portValues[hIn] = sum;
+                                    const auto &pin = portDescs[hIn];
+                                    portMap[makeKey(pin.nodeId, pin.portId)] = sum;
+                                }
+                            }
+                        }
+                    }
+                } else { // float/default
+                    float sum = 0.0f;
+                    std::string dbg = "inputs:";
+                    for (const auto &ip : it->inputs) {
+                        float v = 0.0f;
+                        int hIn = getPortHandle(it->id, ip.id, "input");
+                        if (hIn >= 0 && (size_t)hIn < portValues.size()) {
+                            const Value &vv = this->portValues[hIn];
+                            if (std::holds_alternative<float>(vv)) v = std::get<float>(vv);
+                            else if (std::holds_alternative<double>(vv)) v = (float)std::get<double>(vv);
+                            else if (std::holds_alternative<int>(vv)) v = (float)std::get<int>(vv);
+                        } else {
+                            for (const auto &cc : connections) if (cc.toNode == it->id && cc.toPort == ip.id) {
+                                auto outKey2 = makeKey(cc.fromNode, cc.fromPort);
+                                auto itv = portMap.find(outKey2);
+                                if (itv != portMap.end()) {
+                                    const Value &vv = itv->second;
+                                    if (std::holds_alternative<float>(vv)) v = std::get<float>(vv);
+                                    else if (std::holds_alternative<double>(vv)) v = (float)std::get<double>(vv);
+                                    else if (std::holds_alternative<int>(vv)) v = (float)std::get<int>(vv);
+                                }
+                                break;
+                            }
+                        }
+                        sum += v;
+                        dbg += " " + std::to_string(v);
+                    }
+                    
+                    for (auto &op : it->outputs) {
+                        op.value = sum;
+                        auto outKey = makeKey(it->id, op.id);
+                        portMap[outKey] = sum;
+                        int hOut = getPortHandle(it->id, op.id, "output");
+                        if (hOut >= 0 && (size_t)hOut < portValues.size()) {
+                            this->portValues[hOut] = sum;
+                            if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                            for (int hIn : outToIn[hOut]) {
+                                if (hIn >= 0 && (size_t)hIn < portValues.size()) {
+                                    this->portValues[hIn] = sum;
+                                    const auto &pin = portDescs[hIn];
+                                    portMap[makeKey(pin.nodeId, pin.portId)] = sum;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            handled = true;
+        }
+        if (!handled) {
+            // Fallback to map-based Node::execute
+            it->execute(portMap);
+            for (const auto& out : it->outputs) {
+                auto outKey = makeKey(it->id, out.id);
+                portMap[outKey] = out.value;
+                int hOut = getPortHandle(it->id, out.id, "output");
+                if (hOut >= 0 && (size_t)hOut < portValues.size()) {
+                    this->portValues[hOut] = out.value;
+                    if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                    for (int hIn : outToIn[hOut]) {
+                        if (hIn >= 0 && (size_t)hIn < portValues.size()) {
+                            this->portValues[hIn] = out.value;
+                            const auto &pin = portDescs[hIn];
+                            portMap[makeKey(pin.nodeId, pin.portId)] = out.value;
+                        }
+                    }
+                }
+            }
+        }
+        enqueueDependents(it->id);
+        // Mark node changed if primary output changed compared to previous
+        if (!it->outputs.empty() && hasPrev0) {
+            const auto &new0 = it->outputs[0].value;
+            bool changed = prevOut0.index() != new0.index();
+            if (!changed) {
+                if (std::holds_alternative<float>(new0)) changed = std::get<float>(prevOut0) != std::get<float>(new0);
+                else if (std::holds_alternative<double>(new0)) changed = std::get<double>(prevOut0) != std::get<double>(new0);
+                else if (std::holds_alternative<int>(new0)) changed = std::get<int>(prevOut0) != std::get<int>(new0);
+                else if (std::holds_alternative<std::string>(new0)) changed = std::get<std::string>(prevOut0) != std::get<std::string>(new0);
+            }
+            if (changed) outputChangedStamp[it->id] = evalGeneration;
+        }
+    };
+
+    // Deterministic full pass in topo order (temporary while stabilizing SoA scheduling)
+    for (const auto& nodeId : executionOrder) processNode(nodeId);
+    readyQueue.clear();
+    coldStart = false;
+}
+
+void FlowEngine::enqueueNode(const NodeId& id) {
+    // Dedup by generation and stable order by topo index
+    if (readyStamp[id] == evalGeneration) return;
+    readyStamp[id] = evalGeneration;
+    readyQueue.push_back(id);
+    std::stable_sort(readyQueue.begin(), readyQueue.end(), [&](const NodeId& a, const NodeId& b){
+        int ia = topoIndex.count(a) ? topoIndex[a] : 0;
+        int ib = topoIndex.count(b) ? topoIndex[b] : 0;
+        if (ia != ib) return ia < ib;
+        return a < b;
+    });
+}
+
+void FlowEngine::enqueueDependents(const NodeId& id) {
+    auto it = dependents.find(id);
+    if (it == dependents.end()) return;
+    for (const auto &dn : it->second) enqueueNode(dn);
 }
 
 std::unordered_map<NodeId, std::vector<Value>> FlowEngine::getOutputs() const {
@@ -280,6 +608,45 @@ std::unordered_map<NodeId, std::vector<Value>> FlowEngine::getOutputs() const {
         }
     }
     return outputs;
+}
+
+Generation FlowEngine::beginSnapshot() {
+    return ++snapshotGeneration;
+}
+
+std::unordered_map<NodeId, Value> FlowEngine::getOutputsChangedSince(Generation lastSnapshotGen) const {
+    std::unordered_map<NodeId, Value> out;
+    for (const auto& n : nodes) {
+        if (n.outputs.empty()) continue;
+        auto it = outputChangedStamp.find(n.id);
+        if (it != outputChangedStamp.end() && it->second > lastSnapshotGen) {
+            out.emplace(n.id, n.outputs[0].value);
+        }
+    }
+    return out;
+}
+
+std::vector<std::tuple<NodeId, PortId, Value>> FlowEngine::getPortDeltasChangedSince(Generation lastSnapshotGen) const {
+    std::vector<std::tuple<NodeId, PortId, Value>> deltas;
+    for (const auto &pd : portDescs) {
+        if (pd.direction != "output") continue;
+        if (static_cast<size_t>(pd.handle) >= portChangedStamp.size()) continue;
+        if (portChangedStamp[pd.handle] > lastSnapshotGen) {
+            // find node and port current value
+            for (const auto &n : nodes) {
+                if (n.id == pd.nodeId) {
+                    for (const auto &op : n.outputs) {
+                        if (op.id == pd.portId) {
+                            deltas.emplace_back(pd.nodeId, pd.portId, op.value);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    return deltas;
 }
 
 void FlowEngine::compileToExecutable(const std::string& outputFile, bool /*dslMode*/) {
@@ -366,8 +733,40 @@ void FlowEngine::compileToExecutable(const std::string& outputFile, bool /*dslMo
 void NodeFlow::FlowEngine::setNodeValue(const std::string& nodeId, float value) {
     auto it = std::find_if(nodes.begin(), nodes.end(), [&](const Node& n){ return n.id == nodeId; });
     if (it == nodes.end()) return;
+    float prev = 0.0f;
+    if (!it->outputs.empty()) {
+        const auto &v = it->outputs[0].value;
+        if (std::holds_alternative<float>(v)) prev = std::get<float>(v);
+        else if (std::holds_alternative<double>(v)) prev = static_cast<float>(std::get<double>(v));
+        else if (std::holds_alternative<int>(v)) prev = static_cast<float>(std::get<int>(v));
+    }
     it->parameters["value"] = static_cast<float>(value);
+    bool changed = (prev != value);
     for (auto &out : it->outputs) out.value = static_cast<float>(value);
+    // Update SoA values immediately for this node's outputs and propagate to downstream inputs
+    for (const auto &op : it->outputs) {
+        int hOut = getPortHandle(it->id, op.id, "output");
+        if (hOut >= 0 && static_cast<size_t>(hOut) < portValues.size()) {
+            portValues[hOut] = static_cast<float>(value);
+            if (static_cast<size_t>(hOut) < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+            for (int hIn : outToIn[hOut]) {
+                if (hIn >= 0 && static_cast<size_t>(hIn) < portValues.size()) {
+                    portValues[hIn] = static_cast<float>(value);
+                }
+            }
+        }
+    }
+    if (changed) {
+        // mark node output changed this eval generation
+        outputChangedStamp[it->id] = evalGeneration;
+        // and the port handle
+        for (const auto &op : it->outputs) {
+            int ph = getPortHandle(it->id, op.id, "output");
+            if (ph >= 0 && static_cast<size_t>(ph) < portChangedStamp.size()) portChangedStamp[ph] = evalGeneration;
+        }
+        // enqueue dependents for re-evaluation
+        enqueueDependents(it->id);
+    }
 }
 
 void NodeFlow::FlowEngine::setNodeConfigMinMax(const std::string& nodeId, int minIntervalMs, int maxIntervalMs) {
