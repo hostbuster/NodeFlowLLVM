@@ -749,6 +749,7 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
     // Header
     h << "#pragma once\n";
     h << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
+    h << "#include <stddef.h>\n";
     h << "typedef struct {\n";
     for (const auto* n : inputNodes) h << "  " << toCType(n->outputs[0].dataType) << " " << n->id << ";\n";
     h << "} NodeFlowInputs;\n";
@@ -758,6 +759,23 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
     h << "typedef struct {\n";
     h << "} NodeFlowState;\n";
     h << "void nodeflow_step(const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* state);\n";
+
+    // Expose descriptors to host (handles/topo/ports)
+    h << "typedef struct { int handle; const char* nodeId; const char* portId; int is_output; const char* dtype; } NodeFlowPortDesc;\n";
+    h << "extern const int NODEFLOW_NUM_PORTS;\n";
+    h << "extern const NodeFlowPortDesc NODEFLOW_PORTS[];\n";
+    h << "extern const int NODEFLOW_NUM_TOPO;\n";
+    h << "extern const int NODEFLOW_TOPO_ORDER[];\n";
+    // Dynamic input field mapping (host can set inputs by nodeId)
+    h << "typedef struct { const char* nodeId; size_t offset; const char* dtype; } NodeFlowInputField;\n";
+    h << "extern const int NODEFLOW_NUM_INPUT_FIELDS;\n";
+    h << "extern const NodeFlowInputField NODEFLOW_INPUT_FIELDS[];\n";
+    // Parity-style helper APIs (host-driven AOT runtime)
+    h << "void nodeflow_init(NodeFlowState* state);\n";
+    h << "void nodeflow_reset(NodeFlowState* state);\n";
+    h << "void nodeflow_set_input(int handle, double value, NodeFlowInputs* in, NodeFlowState* state);\n";
+    h << "void nodeflow_tick(double dt_ms, const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* state);\n";
+    h << "double nodeflow_get_output(int handle, const NodeFlowOutputs* out, const NodeFlowState* state);\n";
     h << "#ifdef __cplusplus\n}\n#endif\n";
     h.close();
 
@@ -767,6 +785,69 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
 
     c << "#include \"" << headerPath << "\"\n";
     c << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
+
+    // Emit topo order as handles of nodes in executionOrder
+    c << "const int NODEFLOW_NUM_TOPO = " << executionOrder.size() << ";\n";
+    c << "const int NODEFLOW_TOPO_ORDER[" << executionOrder.size() << "] = {";
+    for (size_t i = 0; i < executionOrder.size(); ++i) {
+        // For nodes, we expose their position index as a stable ordinal
+        c << (i == 0 ? "" : ",") << (int)i;
+    }
+    c << "};\n";
+
+    // Emit port descriptors with engine-consistent handles
+    struct TempPort { int handle; std::string nodeId; std::string portId; bool isOutput; std::string dtype; };
+    std::vector<TempPort> tempPorts;
+    for (const auto &n : nodes) {
+        for (const auto &ip : n.inputs) {
+            int h = getPortHandle(n.id, ip.id, "input");
+            tempPorts.push_back({h, n.id, ip.id, false, ip.dataType});
+        }
+        for (const auto &op : n.outputs) {
+            int h = getPortHandle(n.id, op.id, "output");
+            tempPorts.push_back({h, n.id, op.id, true, op.dataType});
+        }
+    }
+    c << "const int NODEFLOW_NUM_PORTS = " << tempPorts.size() << ";\n";
+    c << "const NodeFlowPortDesc NODEFLOW_PORTS[" << tempPorts.size() << "] = {\n";
+    for (size_t i = 0; i < tempPorts.size(); ++i) {
+        const auto &p = tempPorts[i];
+        c << "  { " << p.handle << ", \"" << p.nodeId << "\", \"" << p.portId << "\", " << (p.isOutput?1:0) << ", \"" << toCType(p.dtype) << "\" }" << (i+1<tempPorts.size()? ",\n":"\n");
+    }
+    c << "};\n\n";
+
+    // Emit input field offsets for dynamic hosts
+    std::vector<const Node*> inNodes;
+    for (const auto &n : nodes) if (n.type == "DeviceTrigger" && !n.outputs.empty()) inNodes.push_back(&n);
+    c << "const int NODEFLOW_NUM_INPUT_FIELDS = " << inNodes.size() << ";\n";
+    c << "const NodeFlowInputField NODEFLOW_INPUT_FIELDS[" << inNodes.size() << "] = {\n";
+    for (size_t i = 0; i < inNodes.size(); ++i) {
+        const auto *n = inNodes[i];
+        c << "  { \"" << n->id << "\", offsetof(NodeFlowInputs, " << n->id << "), \"" << toCType(n->outputs[0].dataType) << "\" }" << (i+1<inNodes.size()? ",\n":"\n");
+    }
+    c << "};\n\n";
+    // Parity-style helper API definitions
+    c << "void nodeflow_init(NodeFlowState*) { }\n";
+    c << "void nodeflow_reset(NodeFlowState*) { }\n";
+    c << "void nodeflow_set_input(int handle, double value, NodeFlowInputs* in, NodeFlowState*) {\n";
+    for (const auto *n : inputNodes) {
+        int h = -1; for (const auto &op : n->outputs) { h = getPortHandle(n->id, op.id, "output"); break; }
+        if (h >= 0) {
+            c << "  if (handle == " << h << ") in->" << n->id << " = (" << toCType(n->outputs[0].dataType) << ")value;\n";
+        }
+    }
+    c << "}\n";
+    c << "double nodeflow_get_output(int handle, const NodeFlowOutputs* out, const NodeFlowState*) {\n";
+    for (const auto *sn : sinkNodes) {
+        int h = -1; for (const auto &op : sn->outputs) { h = getPortHandle(sn->id, op.id, "output"); break; }
+        if (h >= 0) {
+            c << "  if (handle == " << h << ") return (double)out->" << sn->id << ";\n";
+        }
+    }
+    c << "  return 0.0;\n";
+    c << "}\n";
+    c << "void nodeflow_tick(double, const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* state) { nodeflow_step(in, out, state); }\n\n";
+
     c << "void nodeflow_step(const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState*) {\n";
     // Temp vars for node outputs
     for (const auto& n : nodes) if (!n.outputs.empty()) c << "  " << toCType(n.outputs[0].dataType) << " _" << n.id << " = 0;\n";
