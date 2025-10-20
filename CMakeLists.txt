@@ -17,8 +17,6 @@ option(NODEFLOW_BUILD_RUNTIME "Build interactive runtime (NodeFlowCore)" ON)
 # Find nlohmann_json
 find_package(nlohmann_json REQUIRED)
 
-# WebSockets (Simple-WebSocket-Server) toggle
-option(NODEFLOW_WS_ENABLE "Enable WebSocket streaming from runtime" OFF)
 
 # OpenSSL (needed by Simple-WebSocket-Server for base64/sha1 even with WS)
 find_package(OpenSSL QUIET)
@@ -139,28 +137,25 @@ if(NODEFLOW_BUILD_RUNTIME)
   target_link_libraries(NodeFlowCore PRIVATE
       nlohmann_json::nlohmann_json
   )
-  if(NODEFLOW_WS_ENABLE)
-    target_link_libraries(NodeFlowCore PRIVATE Simple-WebSocket-Server)
-    # Fallback include/libs if imported targets are not available
-    if(NOT TARGET OpenSSL::SSL)
-      target_include_directories(NodeFlowCore PRIVATE ${OPENSSL_INCLUDE_DIR})
-      # Reuse the resolved libs above if available
-      if(OPENSSL_SSL_LIB_FOUND AND OPENSSL_CRYPTO_LIB_FOUND)
-        target_link_libraries(NodeFlowCore PRIVATE ${OPENSSL_SSL_LIB_FOUND} ${OPENSSL_CRYPTO_LIB_FOUND})
-      else()
-        target_link_libraries(NodeFlowCore PRIVATE ${OPENSSL_LIBRARIES})
-      endif()
+  # Always enable WebSocket IPC
+  target_link_libraries(NodeFlowCore PRIVATE Simple-WebSocket-Server)
+  # Fallback include/libs if imported targets are not available
+  if(NOT TARGET OpenSSL::SSL)
+    target_include_directories(NodeFlowCore PRIVATE ${OPENSSL_INCLUDE_DIR})
+    # Reuse the resolved libs above if available
+    if(OPENSSL_SSL_LIB_FOUND AND OPENSSL_CRYPTO_LIB_FOUND)
+      target_link_libraries(NodeFlowCore PRIVATE ${OPENSSL_SSL_LIB_FOUND} ${OPENSSL_CRYPTO_LIB_FOUND})
+    else()
+      target_link_libraries(NodeFlowCore PRIVATE ${OPENSSL_LIBRARIES})
     endif()
-    target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_WS_ENABLE=1 ASIO_STANDALONE)
-    if(APPLE)
-      target_link_options(NodeFlowCore PRIVATE
-        -L/opt/homebrew/opt/openssl@3/lib
-        -Wl,-rpath,/opt/homebrew/opt/openssl@3/lib
-        -Wl,-search_paths_first
-      )
-    endif()
-  else()
-    target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_WS_ENABLE=0)
+  endif()
+  target_compile_definitions(NodeFlowCore PRIVATE ASIO_STANDALONE)
+  if(APPLE)
+    target_link_options(NodeFlowCore PRIVATE
+      -L/opt/homebrew/opt/openssl@3/lib
+      -Wl,-rpath,/opt/homebrew/opt/openssl@3/lib
+      -Wl,-search_paths_first
+    )
   endif()
   target_link_libraries(NodeFlowCore PRIVATE CLI11::CLI11)
   target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_HAS_CLI11=1)

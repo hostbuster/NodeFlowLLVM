@@ -7,19 +7,13 @@
 #include <random>
 #include <iostream>
 #include <CLI/CLI.hpp>
-#if NODEFLOW_WS_ENABLE
 #include "third_party/Simple-WebSocket-Server/server_ws.hpp"
 #include <mutex>
 #include <atomic>
-#endif
 
 // Global state
 std::atomic<bool> running(true);
 
-// Legacy C ABI hooks are not used in headless mode
-extern "C" int isKeyPressed(const char*) { return 0; }
-extern "C" int isRandomReady(int, int) { return 0; }
-extern "C" float getRandomNumber() { return 0.0f; }
 
 int main(int argc, char** argv) {
     // Initialize random seed
@@ -31,23 +25,16 @@ int main(int argc, char** argv) {
     std::string flowPath = "devicetrigger_addition.json";
     bool buildAOT = false;
     std::string outDir;
-#if NODEFLOW_WS_ENABLE
-    bool wsEnable = true;
     int wsPort = 9002;
     std::string wsPath = "/stream";
-    int wsThrottleHz = 20;
-#endif
     CLI::App app{"NodeFlowCore"};
     try {
         app.add_option("--flow", flowPath, "Path to flow JSON file");
         app.add_flag("--build-aot", buildAOT, "Generate AOT step library using flow basename");
         app.add_option("--out-dir", outDir, "Directory to write generated AOT files");
-#if NODEFLOW_WS_ENABLE
-        app.add_flag("--ws-enable", wsEnable, "Enable WebSocket streaming");
         app.add_option("--ws-port", wsPort, "WebSocket port");
         app.add_option("--ws-path", wsPath, "WebSocket path (e.g., /stream)");
-        app.add_option("--ws-throttle-hz", wsThrottleHz, "Max messages per second");
-#endif
+        
         app.allow_extras(false);
         app.validate_positionals();
         app.set_config();
@@ -129,20 +116,15 @@ int main(int argc, char** argv) {
 
     // Initialize ncurses (optional)
     // Startup message
-#if NODEFLOW_WS_ENABLE
-    std::cout << "NodeFlowCore started. WS=" << (wsEnable?"on":"off") << ", flow='" << flowPath << "'\n";
-#else
-    std::cout << "NodeFlowCore started. flow='" << flowPath << "'\n";
-#endif
+    std::cout << "NodeFlowCore started. WS=on, flow='" << flowPath << "'\n";
 
     // WebSocket server (optional)
-#if NODEFLOW_WS_ENABLE
     using WsServer = SimpleWeb::SocketServer<SimpleWeb::WS>;
     std::unique_ptr<WsServer> wsServer;
     std::thread wsThread;
     std::mutex wsMutex;
     std::string latestJson; // last snapshot/delta, for simple demo
-    if (wsEnable) {
+    {
         wsServer = std::make_unique<WsServer>();
         wsServer->config.port = wsPort;
 
@@ -243,7 +225,6 @@ int main(int argc, char** argv) {
 
         wsThread = std::thread([&]{ wsServer->start(); });
     }
-#endif
 
     // Main loop: Run flow and update display
     float last_sum = -9999.0f;
@@ -277,8 +258,7 @@ int main(int argc, char** argv) {
             last_sum = calc_sum;
         }
 
-#if NODEFLOW_WS_ENABLE
-        if (wsEnable) {
+        {
             // Emit a compact JSON snapshot for the demo
             char buf[256];
             int n = std::snprintf(buf, sizeof(buf),
@@ -299,7 +279,6 @@ int main(int argc, char** argv) {
                 }
             }
         }
-#endif
 
         // Small delay to prevent CPU overuse
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
