@@ -321,12 +321,10 @@ void FlowEngine::execute() {
     // bump evaluation generation
     ++evalGeneration;
 
-    std::unordered_map<PortId, Value> portMap;
     auto makeKey = [](const std::string& nodeId, const std::string& portId) { return nodeId + ":" + portId; };
-    // Seed with last outputs so downstream consumers see previous values if no new events
+    // Seed SoA with last outputs so downstream consumers see previous values if no new events
     for (const auto& node : nodes) {
         for (const auto& output : node.outputs) {
-            portMap[makeKey(node.id, output.id)] = output.value;
             int hOut = getPortHandle(node.id, output.id, "output");
             if (hOut >= 0 && static_cast<size_t>(hOut) < portValues.size()) this->portValues[hOut] = output.value;
         }
@@ -338,8 +336,7 @@ void FlowEngine::execute() {
         for (int hIn : outToIn[hOut]) {
             if (hIn >= 0 && static_cast<size_t>(hIn) < portValues.size()) {
                 this->portValues[hIn] = this->portValues[hOut];
-                const auto &pin = portDescs[hIn];
-                portMap[makeKey(pin.nodeId, pin.portId)] = this->portValues[hIn];
+                (void)portDescs; // SoA propagation only; map no longer used
             }
         }
     }
@@ -350,11 +347,7 @@ void FlowEngine::execute() {
         // Capture previous first-output value for change detection
         Value prevOut0;
         bool hasPrev0 = false;
-        if (!it->outputs.empty()) {
-            auto key0 = makeKey(it->id, it->outputs[0].id);
-            auto pvIt = portMap.find(key0);
-            if (pvIt != portMap.end()) { prevOut0 = pvIt->second; hasPrev0 = true; }
-        }
+        if (!it->outputs.empty()) { prevOut0 = it->outputs[0].value; hasPrev0 = true; }
         // Handle-based execution for common node types (Value, DeviceTrigger, Add)
         bool handled = false;
         if (it->type == "Value") {
@@ -363,8 +356,6 @@ void FlowEngine::execute() {
             if (p != it->parameters.end()) v = p->second;
             for (auto &op : it->outputs) {
                 op.value = v;
-                auto outKey = makeKey(it->id, op.id);
-                portMap[outKey] = v;
                 int hOut = getPortHandle(it->id, op.id, "output");
                 if (hOut >= 0 && (size_t)hOut < portValues.size()) {
                     this->portValues[hOut] = v;
@@ -372,8 +363,7 @@ void FlowEngine::execute() {
                     for (int hIn : outToIn[hOut]) {
                         if (hIn >= 0 && (size_t)hIn < portValues.size()) {
                             this->portValues[hIn] = v;
-                            const auto &pin = portDescs[hIn];
-                            portMap[makeKey(pin.nodeId, pin.portId)] = v;
+                            (void)portDescs;
                         }
                     }
                 }
@@ -387,8 +377,6 @@ void FlowEngine::execute() {
             if (p != it->parameters.end()) { vOut = p->second; have = true; }
             for (auto &op : it->outputs) {
                 if (have) op.value = vOut;
-                auto outKey = makeKey(it->id, op.id);
-                portMap[outKey] = op.value;
                 int hOut = getPortHandle(it->id, op.id, "output");
                 if (hOut >= 0 && (size_t)hOut < portValues.size()) {
                     this->portValues[hOut] = op.value;
@@ -396,8 +384,7 @@ void FlowEngine::execute() {
                     for (int hIn : outToIn[hOut]) {
                         if (hIn >= 0 && (size_t)hIn < portValues.size()) {
                             this->portValues[hIn] = op.value;
-                            const auto &pin = portDescs[hIn];
-                            portMap[makeKey(pin.nodeId, pin.portId)] = op.value;
+                            (void)portDescs;
                         }
                     }
                 }
@@ -419,19 +406,6 @@ void FlowEngine::execute() {
                             if (std::holds_alternative<int>(vv)) v = std::get<int>(vv);
                             else if (std::holds_alternative<float>(vv)) v = (int)std::get<float>(vv);
                             else if (std::holds_alternative<double>(vv)) v = (int)std::get<double>(vv);
-                        } else {
-                            // Fallback via connections map
-                            for (const auto &cc : connections) if (cc.toNode == it->id && cc.toPort == ip.id) {
-                                auto outKey2 = makeKey(cc.fromNode, cc.fromPort);
-                                auto itv = portMap.find(outKey2);
-                                if (itv != portMap.end()) {
-                                    const Value &vv = itv->second;
-                                    if (std::holds_alternative<int>(vv)) v = std::get<int>(vv);
-                                    else if (std::holds_alternative<float>(vv)) v = (int)std::get<float>(vv);
-                                    else if (std::holds_alternative<double>(vv)) v = (int)std::get<double>(vv);
-                                }
-                                break;
-                            }
                         }
                         sum += v;
                         dbg += " " + std::to_string(v);
@@ -439,8 +413,6 @@ void FlowEngine::execute() {
                     
                     for (auto &op : it->outputs) {
                         op.value = sum;
-                        auto outKey = makeKey(it->id, op.id);
-                        portMap[outKey] = sum;
                         int hOut = getPortHandle(it->id, op.id, "output");
                         if (hOut >= 0 && (size_t)hOut < portValues.size()) {
                             this->portValues[hOut] = sum;
@@ -448,8 +420,7 @@ void FlowEngine::execute() {
                             for (int hIn : outToIn[hOut]) {
                                 if (hIn >= 0 && (size_t)hIn < portValues.size()) {
                                     this->portValues[hIn] = sum;
-                                    const auto &pin = portDescs[hIn];
-                                    portMap[makeKey(pin.nodeId, pin.portId)] = sum;
+                                    (void)portDescs;
                                 }
                             }
                         }
@@ -465,18 +436,6 @@ void FlowEngine::execute() {
                             if (std::holds_alternative<double>(vv)) v = std::get<double>(vv);
                             else if (std::holds_alternative<float>(vv)) v = (double)std::get<float>(vv);
                             else if (std::holds_alternative<int>(vv)) v = (double)std::get<int>(vv);
-                        } else {
-                            for (const auto &cc : connections) if (cc.toNode == it->id && cc.toPort == ip.id) {
-                                auto outKey2 = makeKey(cc.fromNode, cc.fromPort);
-                                auto itv = portMap.find(outKey2);
-                                if (itv != portMap.end()) {
-                                    const Value &vv = itv->second;
-                                    if (std::holds_alternative<double>(vv)) v = std::get<double>(vv);
-                                    else if (std::holds_alternative<float>(vv)) v = (double)std::get<float>(vv);
-                                    else if (std::holds_alternative<int>(vv)) v = (double)std::get<int>(vv);
-                                }
-                                break;
-                            }
                         }
                         sum += v;
                         dbg += " " + std::to_string(v);
@@ -484,8 +443,6 @@ void FlowEngine::execute() {
                     
                     for (auto &op : it->outputs) {
                         op.value = sum;
-                        auto outKey = makeKey(it->id, op.id);
-                        portMap[outKey] = sum;
                         int hOut = getPortHandle(it->id, op.id, "output");
                         if (hOut >= 0 && (size_t)hOut < portValues.size()) {
                             this->portValues[hOut] = sum;
@@ -493,8 +450,7 @@ void FlowEngine::execute() {
                             for (int hIn : outToIn[hOut]) {
                                 if (hIn >= 0 && (size_t)hIn < portValues.size()) {
                                     this->portValues[hIn] = sum;
-                                    const auto &pin = portDescs[hIn];
-                                    portMap[makeKey(pin.nodeId, pin.portId)] = sum;
+                                    (void)portDescs;
                                 }
                             }
                         }
@@ -510,18 +466,6 @@ void FlowEngine::execute() {
                             if (std::holds_alternative<float>(vv)) v = std::get<float>(vv);
                             else if (std::holds_alternative<double>(vv)) v = (float)std::get<double>(vv);
                             else if (std::holds_alternative<int>(vv)) v = (float)std::get<int>(vv);
-                        } else {
-                            for (const auto &cc : connections) if (cc.toNode == it->id && cc.toPort == ip.id) {
-                                auto outKey2 = makeKey(cc.fromNode, cc.fromPort);
-                                auto itv = portMap.find(outKey2);
-                                if (itv != portMap.end()) {
-                                    const Value &vv = itv->second;
-                                    if (std::holds_alternative<float>(vv)) v = std::get<float>(vv);
-                                    else if (std::holds_alternative<double>(vv)) v = (float)std::get<double>(vv);
-                                    else if (std::holds_alternative<int>(vv)) v = (float)std::get<int>(vv);
-                                }
-                                break;
-                            }
                         }
                         sum += v;
                         dbg += " " + std::to_string(v);
@@ -529,8 +473,6 @@ void FlowEngine::execute() {
                     
                     for (auto &op : it->outputs) {
                         op.value = sum;
-                        auto outKey = makeKey(it->id, op.id);
-                        portMap[outKey] = sum;
                         int hOut = getPortHandle(it->id, op.id, "output");
                         if (hOut >= 0 && (size_t)hOut < portValues.size()) {
                             this->portValues[hOut] = sum;
@@ -538,8 +480,7 @@ void FlowEngine::execute() {
                             for (int hIn : outToIn[hOut]) {
                                 if (hIn >= 0 && (size_t)hIn < portValues.size()) {
                                     this->portValues[hIn] = sum;
-                                    const auto &pin = portDescs[hIn];
-                                    portMap[makeKey(pin.nodeId, pin.portId)] = sum;
+                                    (void)portDescs;
                                 }
                             }
                         }
@@ -547,26 +488,8 @@ void FlowEngine::execute() {
                 }
             }
             handled = true;
-        }
-        if (!handled) {
-            // Fallback to map-based Node::execute
-            it->execute(portMap);
-            for (const auto& out : it->outputs) {
-                auto outKey = makeKey(it->id, out.id);
-                portMap[outKey] = out.value;
-                int hOut = getPortHandle(it->id, out.id, "output");
-                if (hOut >= 0 && (size_t)hOut < portValues.size()) {
-                    this->portValues[hOut] = out.value;
-                    if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
-                    for (int hIn : outToIn[hOut]) {
-                        if (hIn >= 0 && (size_t)hIn < portValues.size()) {
-                            this->portValues[hIn] = out.value;
-                            const auto &pin = portDescs[hIn];
-                            portMap[makeKey(pin.nodeId, pin.portId)] = out.value;
-                        }
-                    }
-                }
-            }
+        } else {
+            // Unknown node type: leave outputs unchanged (no-op)
         }
         enqueueDependents(it->id);
         // Mark node changed if primary output changed compared to previous
@@ -583,10 +506,18 @@ void FlowEngine::execute() {
         }
     };
 
-    // Deterministic full pass in topo order (simple, correct baseline)
-    for (const auto& nodeId : executionOrder) processNode(nodeId);
-    readyQueue.clear();
-    coldStart = false;
+    // Deterministic scheduling: first time run full topo, then ready-queue
+    if (coldStart) {
+        for (const auto& nodeId : executionOrder) processNode(nodeId);
+        readyQueue.clear();
+        coldStart = false;
+    } else {
+        while (!readyQueue.empty()) {
+            auto nodeId = readyQueue.front();
+            readyQueue.erase(readyQueue.begin());
+            processNode(nodeId);
+        }
+    }
 }
 
 void FlowEngine::enqueueNode(const NodeId& id) {
