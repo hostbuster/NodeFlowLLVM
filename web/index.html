@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>NodeFlow Stream</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+    #vals { display: grid; grid-template-columns: repeat(2, 200px); gap: 8px 24px; align-items: center; }
+    .k { color: #555; }
+    .v { font-weight: 600; }
+    #log { margin-top: 16px; height: 160px; overflow: auto; background: #f7f7f7; padding: 8px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h2>NodeFlow Stream</h2>
+  <div id="status">connecting…</div>
+  <div id="vals">
+    <div class="k">key1</div><div class="v" id="key1">-</div>
+    <div class="k">key2</div><div class="v" id="key2">-</div>
+    <div class="k">random1</div><div class="v" id="random1">-</div>
+    <div class="k">add1</div><div class="v" id="add1">-</div>
+  </div>
+  <div id="log"></div>
+  <script>
+    const statusEl = document.getElementById('status');
+    const vals = { key1: document.getElementById('key1'), key2: document.getElementById('key2'), random1: document.getElementById('random1'), add1: document.getElementById('add1') };
+    const logEl = document.getElementById('log');
+
+    function log(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      logEl.appendChild(d);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    let ws;
+    function connect() {
+      statusEl.textContent = 'connecting…';
+      ws = new WebSocket('ws://127.0.0.1:9002/stream');
+      ws.onopen = () => { statusEl.textContent = 'connected'; log('connected'); };
+      ws.onclose = () => { statusEl.textContent = 'disconnected, retrying…'; log('disconnected'); setTimeout(connect, 1000); };
+      ws.onerror = (e) => { log('error'); };
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'snapshot') {
+            if ('key1' in msg) vals.key1.textContent = msg.key1.toFixed(3);
+            if ('key2' in msg) vals.key2.textContent = msg.key2.toFixed(3);
+            if ('random1' in msg) vals.random1.textContent = msg.random1.toFixed(3);
+            if ('add1' in msg) vals.add1.textContent = msg.add1.toFixed(3);
+          } else {
+            log(ev.data);
+          }
+        } catch { log(ev.data); }
+      };
+    }
+    connect();
+  </script>
+</body>
+</html>
