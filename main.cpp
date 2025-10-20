@@ -6,9 +6,7 @@
 #include <chrono>
 #include <random>
 #include <iostream>
-#if NODEFLOW_HAS_CLI11
 #include <CLI/CLI.hpp>
-#endif
 #if NODEFLOW_WS_ENABLE
 #include "third_party/Simple-WebSocket-Server/server_ws.hpp"
 #include <mutex>
@@ -39,9 +37,8 @@ int main(int argc, char** argv) {
     std::string wsPath = "/stream";
     int wsThrottleHz = 20;
 #endif
-#if NODEFLOW_HAS_CLI11
+    CLI::App app{"NodeFlowCore"};
     try {
-        CLI::App app{"NodeFlowCore"};
         app.add_option("--flow", flowPath, "Path to flow JSON file");
         app.add_flag("--build-aot", buildAOT, "Generate AOT step library using flow basename");
         app.add_option("--out-dir", outDir, "Directory to write generated AOT files");
@@ -57,34 +54,8 @@ int main(int argc, char** argv) {
         app.set_help_all_flag("--help-all", "Show all help");
         app.parse(argc, argv);
     } catch (const CLI::ParseError &e) {
-        return CLI::Exit(e);
+        return app.exit(e);
     }
-#else
-    // Simple fallback: parse --flow=<path>
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        const std::string prefix = "--flow=";
-        if (arg.rfind(prefix, 0) == 0) {
-            flowPath = arg.substr(prefix.size());
-        } else if (arg == "--flow" && i + 1 < argc) {
-            flowPath = argv[++i];
-        } else if (arg == "--build-aot") {
-            buildAOT = true;
-        } else if (arg == "--out-dir" && i + 1 < argc) {
-            outDir = argv[++i];
-#if NODEFLOW_WS_ENABLE
-        } else if (arg == "--ws-enable") {
-            wsEnable = true;
-        } else if (arg == "--ws-port" && i + 1 < argc) {
-            wsPort = std::atoi(argv[++i]);
-        } else if (arg == "--ws-path" && i + 1 < argc) {
-            wsPath = argv[++i];
-        } else if (arg == "--ws-throttle-hz" && i + 1 < argc) {
-            wsThrottleHz = std::atoi(argv[++i]);
-#endif
-        }
-    }
-#endif
 
     nlohmann::json json;
     {
@@ -158,7 +129,11 @@ int main(int argc, char** argv) {
 
     // Initialize ncurses (optional)
     // Startup message
+#if NODEFLOW_WS_ENABLE
     std::cout << "NodeFlowCore started. WS=" << (wsEnable?"on":"off") << ", flow='" << flowPath << "'\n";
+#else
+    std::cout << "NodeFlowCore started. flow='" << flowPath << "'\n";
+#endif
 
     // WebSocket server (optional)
 #if NODEFLOW_WS_ENABLE

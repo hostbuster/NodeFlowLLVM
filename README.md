@@ -1,6 +1,6 @@
 ## NodeFlow: Asynchronous Dataflow Framework
 
-NodeFlowLLVM is a C++ framework for creating and executing dataflow graphs with asynchronous nodes, designed to simulate real-time systems like device triggers. It compiles flows to standalone executables via LLVM for high performance and portability. The demo shows three async inputs (key1, key2, random1) whose values are summed in real-time using ncurses for keyboard input and an internal timer-driven random source.
+NodeFlowLLVM is a C++ framework for creating and executing dataflow graphs with asynchronous nodes, designed to simulate real-time systems like device triggers. It compiles flows to standalone executables via LLVM for high performance and portability. The demo shows three async inputs (key1, key2, random1) whose values are summed in real-time; devices are simulated via a WebSocket-powered web UI.
 
 ### Key Features
 
@@ -8,8 +8,8 @@ NodeFlowLLVM is a C++ framework for creating and executing dataflow graphs with 
 - **JSON Configuration**: Flows are defined in `devicetrigger_addition.json` (nodes, connections, parameters like key triggers and random intervals).
 - **Real-Time Updates**: Outputs update dynamically on key presses and on periodic random triggers.
 - **LLVM Compilation**: Generates optimized native code with a DSL-like `run_flow` entry point for easy integration.
-- **ncurses Integration**: Real-time keyboard input for interactive terminal applications.
 - **WebSocket Streaming (optional)**: Stream node updates and sums to a web UI via Simple-WebSocket-Server.
+  - The web UI also sends input events (simulate devices) to the core.
 
 ### Why LLVM + a DSL
 
@@ -38,10 +38,10 @@ This eliminates manual event-loop coding and enables rapid prototyping of comple
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
 # Dependencies
-brew install llvm ncurses nlohmann-json
+brew install llvm nlohmann-json asio openssl@3 cmake
 ```
 
-Note: On macOS, ncurses is provided by Homebrew. CMake links `${CURSES_LIBRARIES}` (typically under `/opt/homebrew/opt/ncurses` on Apple Silicon or `/usr/local/opt/ncurses` on Intel).
+Note: On macOS Apple Silicon, prefer Homebrew at `/opt/homebrew`. We link against `openssl@3` and use standalone `asio`.
 
 #### Build (runtime + AOT enabled by default)
 
@@ -57,14 +57,16 @@ cmake .. -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 make -j
 ```
 
-#### Run (runtime)
+#### Run (runtime, headless + WebSockets)
 
 ```bash
-./NodeFlowCore --flow devicetrigger_addition.json
+./NodeFlowCore --flow devicetrigger_addition.json --ws-enable
 ```
 
-- **Interact**: Press `1` or `2` to trigger `key1` (1.0) or `key2` (2.0). `random1` updates every 100–500 ms with a value in `[0, 100]`. Press `q` to quit.
-- **Output**: The ncurses UI shows the current sum and node statuses.
+- **Interact** (web UI): open `web/index.html` in your browser; it connects to `ws://127.0.0.1:9002/stream`.
+  - Toggle checkboxes for `key1` and `key2` to send values (1.0/2.0) to the core.
+  - Use the slider for `random1` (0–100) to send updates.
+  - The UI displays values received from the core and the `add1` result.
 
 ### New: Command-line flags
 
@@ -109,13 +111,13 @@ cmake -S . -B build -DNODEFLOW_BUILD_RUNTIME=OFF && cmake --build build
 
 ### Runtime details
 
-- Non-blocking `DeviceTrigger` nodes: 
-  - Keyboard triggers update immediately on key press.
-  - Random trigger updates on internal per-node timers honoring JSON `min_interval`/`max_interval` (no external thread required).
+- Non-blocking `DeviceTrigger` nodes:
+  - Inputs are driven by the web UI over WebSockets (no ncurses / keyboard dependency).
+  - Random can be driven from the UI; internal timers can be enabled per flow if needed.
 - Values persist between ticks; the sum updates when any input changes.
 - UI displays per-node values and both a calculated sum and the engine sum for verification.
 
-### WebSocket streaming + Web UI (optional)
+### WebSocket streaming + Web UI
 
 - Build with WS enabled:
 
@@ -127,14 +129,14 @@ cmake -S . -B build -DNODEFLOW_WS_ENABLE=ON && cmake --build build
 
 ```bash
 ./build/NodeFlowCore --flow devicetrigger_addition.json --ws-enable
-# Then open web/index.html in your browser (connects to ws://127.0.0.1:9002/stream)
+# Then open web/index.html (connects to ws://127.0.0.1:9002/stream)
 ```
 
 - The runtime broadcasts compact NDJSON-style JSON snapshots with current node values (key1, key2, random1) and `add1`.
 
 ### Build options
 
-- `-DNODEFLOW_CODEGEN=ON|OFF` (default ON): include the demo standalone codegen (`nodeflow_output`).
+- `-DNODEFLOW_CODEGEN=ON|OFF` (default ON): include the demo standalone codegen (`nodeflow_output`). We will iterate on LLVM/codegen next.
 - `-DNODEFLOW_BUILD_RUNTIME=ON|OFF` (default ON): build the interactive runtime `NodeFlowCore`.
 - `-DNODEFLOW_WS_ENABLE=ON|OFF` (default OFF): enable WebSocket support in the runtime.
 
@@ -143,16 +145,14 @@ cmake -S . -B build -DNODEFLOW_WS_ENABLE=ON && cmake --build build
 - `devicetrigger_addition.json`: Defines the dataflow (two keyboard triggers, one random trigger, one add node).
 - `NodeFlowCore.hpp`: Core framework structures and interfaces.
 - `NodeFlowCore.cpp`: Node execution and LLVM compilation.
-- `main.cpp`: ncurses UI, JSON loading, optional WebSocket server, and codegen hooks.
-- `CMakeLists.txt`: Build configuration for nlohmann-json, ncurses, optional WS, and optional LLVM demo codegen.
+- `main.cpp`: JSON loading, WebSocket server, and codegen hooks.
+- `CMakeLists.txt`: Build configuration for nlohmann-json, WebSockets (Asio + OpenSSL@3), and optional LLVM demo codegen.
 - `web/index.html`: Minimal WebSocket client to visualize live values.
 - `third_party/Simple-WebSocket-Server`: Header-only WebSocket server library (HTTP(S)/WS(S)) used for streaming.
 
 ### Notes & Troubleshooting
 
-- **macOS + ncurses**: Uses Homebrew’s ncurses for terminal input.
 - **LLVM in PATH**: Ensure Homebrew’s LLVM is first in PATH before running CMake.
-- **Linking errors (ncurses)**: Verify Homebrew paths in CMake or run `brew link ncurses`.
 - **LLVM errors**: Confirm you are using Homebrew’s LLVM (`brew info llvm` for paths).
 - **Config file**: Ensure `devicetrigger_addition.json` is in the project root.
 

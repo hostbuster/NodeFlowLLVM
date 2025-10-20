@@ -19,7 +19,6 @@ find_package(nlohmann_json REQUIRED)
 
 # WebSockets (Simple-WebSocket-Server) toggle
 option(NODEFLOW_WS_ENABLE "Enable WebSocket streaming from runtime" OFF)
-option(NODEFLOW_TUI "Enable ncurses TUI for local display" OFF)
 
 # OpenSSL (needed by Simple-WebSocket-Server for base64/sha1 even with WS)
 find_package(OpenSSL QUIET)
@@ -79,13 +78,19 @@ if(ASIO_INCLUDE_DIR)
   message(STATUS "Using Asio include dir: ${ASIO_INCLUDE_DIR}")
 endif()
 
-# Optional CLI11
-find_package(CLI11 QUIET)
-
-if(NODEFLOW_TUI)
-  find_package(Curses REQUIRED)
-  include_directories(${CURSES_INCLUDE_DIR})
+# CLI11 (required). Auto-fetch if not installed
+include(FetchContent)
+find_package(CLI11 QUIET CONFIG)
+if(NOT CLI11_FOUND)
+  message(STATUS "CLI11 not found, fetching...")
+  FetchContent_Declare(
+    CLI11
+    GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+    GIT_TAG v2.4.2
+  )
+  FetchContent_MakeAvailable(CLI11)
 endif()
+
 
 # Header-only Simple-WebSocket-Server (INTERFACE)
 add_library(Simple-WebSocket-Server INTERFACE)
@@ -134,12 +139,6 @@ if(NODEFLOW_BUILD_RUNTIME)
   target_link_libraries(NodeFlowCore PRIVATE
       nlohmann_json::nlohmann_json
   )
-  if(NODEFLOW_TUI)
-    target_link_libraries(NodeFlowCore PRIVATE ${CURSES_LIBRARIES})
-    target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_TUI=1)
-  else()
-    target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_TUI=0)
-  endif()
   if(NODEFLOW_WS_ENABLE)
     target_link_libraries(NodeFlowCore PRIVATE Simple-WebSocket-Server)
     # Fallback include/libs if imported targets are not available
@@ -163,12 +162,8 @@ if(NODEFLOW_BUILD_RUNTIME)
   else()
     target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_WS_ENABLE=0)
   endif()
-  if(CLI11_FOUND)
-    target_link_libraries(NodeFlowCore CLI11::CLI11)
-    target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_HAS_CLI11=1)
-  else()
-    target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_HAS_CLI11=0)
-  endif()
+  target_link_libraries(NodeFlowCore PRIVATE CLI11::CLI11)
+  target_compile_definitions(NodeFlowCore PRIVATE NODEFLOW_HAS_CLI11=1)
 
   # Set output directory for the compiled executable
   set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
