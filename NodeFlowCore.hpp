@@ -1,3 +1,10 @@
+// NodeFlow core types and engine
+//
+// This header defines the in-memory graph (nodes, ports, connections) and a
+// small execution engine that can load a JSON flow, evaluate it, and expose
+// descriptors/handles so higher layers (runtime, WS, AOT) can interact in a
+// generic way. The engine is written to move toward a SoA (structure-of-arrays)
+// layout for performance and determinism.
 #pragma once
 #include <nlohmann/json.hpp>
 #include <vector>
@@ -10,11 +17,12 @@ namespace NodeFlow {
 
 using NodeId = std::string;
 using PortId = std::string;
+// Scalar value that can flow on ports. Extend here to add more types.
 using Value = std::variant<int, float, double, std::string>;
 using PortHandle = int;
 using Generation = unsigned long long;
 
-// Represents a port (input or output)
+// Represents a port (input or output) declared on a node
 struct Port {
     PortId id;
     std::string type; // "input" or "output"
@@ -30,7 +38,7 @@ struct Connection {
     PortId toPort;
 };
 
-// Represents a node
+// Represents a node (operator, device trigger, etc.)
 struct Node {
     NodeId id;
     std::string type;
@@ -41,7 +49,7 @@ struct Node {
     void execute(std::unordered_map<PortId, Value>& portValues);
 };
 
-// Descriptors and introspection
+// Descriptors and introspection (used by WS/runtime/AOT to be fully generic)
 struct PortDesc {
     PortHandle handle;
     NodeId nodeId;
@@ -57,18 +65,24 @@ struct NodeDesc {
     std::vector<PortHandle> outputPorts;
 };
 
-// FlowEngine manages the execution and compilation of the flow
+// FlowEngine manages the flow graph lifecycle: load, execute, describe, AOT
 class FlowEngine {
 public:
     FlowEngine() = default;
+    // Load a graph from JSON (nodes, ports, connections)
     void loadFromJson(const nlohmann::json& json);
+    // Evaluate the graph once (non-blocking, deterministic)
     void execute();
+    // Convenience accessor to current node outputs (kept for compatibility)
     std::unordered_map<NodeId, std::vector<Value>> getOutputs() const;
+    // Minimal AOT/demo codegen helpers
     void compileToExecutable(const std::string& outputFile, bool dslMode = true);
     void generateStepLibrary(const std::string& baseName) const;
 
     // Control helpers for runtime/IPC
+    // Set a node's current value (commonly DeviceTrigger). Propagates downstream.
     void setNodeValue(const std::string& nodeId, float value);
+    // Update per-node timing/config parameters
     void setNodeConfigMinMax(const std::string& nodeId, int minIntervalMs, int maxIntervalMs);
 
     // Introspection
@@ -79,7 +93,9 @@ public:
     void writePort(PortHandle handle, const Value& v) { if (handle >= 0 && (size_t)handle < portValues.size()) portValues[handle] = v; }
 
     // Generation counters and deltas
+    // Begin a new WS snapshot epoch and return its generation
     Generation beginSnapshot();
+    // Compatibility delta helpers for runtime/WS
     std::unordered_map<NodeId, Value> getOutputsChangedSince(Generation lastSnapshotGen) const;
     std::vector<std::tuple<NodeId, PortId, Value>> getPortDeltasChangedSince(Generation lastSnapshotGen) const;
     Generation currentEvalGeneration() const { return evalGeneration; }
@@ -89,7 +105,7 @@ private:
     std::vector<Connection> connections;
     std::vector<NodeId> executionOrder;
 
-    // Interned descriptors
+    // Interned descriptors and handle maps
     std::vector<NodeDesc> nodeDescs;
     std::vector<PortDesc> portDescs;
     std::unordered_map<std::string, PortHandle> portKeyToHandle; // key: nodeId+":"+portId+":"+direction
@@ -103,7 +119,7 @@ private:
     std::vector<std::vector<PortHandle>> outToIn; // output handle -> list of input handles
     std::unordered_map<NodeId, std::vector<PortHandle>> nodeOutputHandles; // node -> its output handles
 
-    // Dirty-driven scheduling (interim implementation)
+    // Deterministic scheduling scaffolding (ready-queue, topo index)
     std::unordered_map<NodeId, std::vector<NodeId>> dependents; // nodeId -> downstream nodes
     std::unordered_map<NodeId, int> topoIndex; // nodeId -> topological order index
     std::vector<NodeId> readyQueue;

@@ -1,3 +1,8 @@
+// NodeFlowCore.cpp
+//
+// Implements the flow engine: JSON load, graph descriptors/handles, execution,
+// and minimal AOT demo generation. The engine is moving toward a SoA layout
+// for high-performance deterministic evaluation.
 #include "NodeFlowCore.hpp"
 #include <fstream>
 #include <algorithm>
@@ -142,6 +147,7 @@ void Node::execute(std::unordered_map<PortId, Value>& portValues) {
     }
 }
 
+// Load a graph from JSON and (re)build descriptors, topology, and adjacency
 void FlowEngine::loadFromJson(const nlohmann::json& json) {
     srand(time(NULL));
     nodes.clear();
@@ -309,6 +315,8 @@ void FlowEngine::computeExecutionOrder() {
     for (size_t i = 0; i < executionOrder.size(); ++i) topoIndex[executionOrder[i]] = static_cast<int>(i);
 }
 
+// Evaluate the graph once (non-blocking). Seeds previous outputs, performs
+// handle-based propagation, and executes nodes in topological order.
 void FlowEngine::execute() {
     // bump evaluation generation
     ++evalGeneration;
@@ -575,7 +583,7 @@ void FlowEngine::execute() {
         }
     };
 
-    // Deterministic full pass in topo order (temporary while stabilizing SoA scheduling)
+    // Deterministic full pass in topo order (simple, correct baseline)
     for (const auto& nodeId : executionOrder) processNode(nodeId);
     readyQueue.clear();
     coldStart = false;

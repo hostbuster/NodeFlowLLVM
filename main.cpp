@@ -1,3 +1,10 @@
+// main.cpp
+//
+// Headless NodeFlow runtime with WebSocket IPC. Parses CLI (CLI11), loads the
+// JSON flow, and starts a WS server that:
+// - Sends a schema describing nodes/ports/handles
+// - Broadcasts generic snapshots and per-port deltas
+// - Accepts control messages (set/config/reload)
 #include "NodeFlowCore.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -86,7 +93,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Generate standalone binary from current flow (no interaction needed)
+    // Optional demo codegen stub (AOT sample); does nothing in runtime
 #if NODEFLOW_CODEGEN
     engine.compileToExecutable("nodeflow_output");
 #endif
@@ -97,7 +104,7 @@ int main(int argc, char** argv) {
     // Startup message
     fmt::print("NodeFlowCore started. WS=on, flow='{}'\n", flowPath);
 
-    // WebSocket server (optional)
+    // WebSocket server (headless IPC)
     using WsServer = SimpleWeb::SocketServer<SimpleWeb::WS>;
     std::unique_ptr<WsServer> wsServer;
     std::thread wsThread;
