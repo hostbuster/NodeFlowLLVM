@@ -111,6 +111,7 @@ int main(int argc, char** argv) {
     std::mutex wsMutex;
     std::mutex engineMutex;
     std::string latestJson; // last snapshot/delta, for simple demo
+    std::string wsRegex; // compiled endpoint regex key for lookups
     {
         wsServer = std::make_unique<WsServer>();
         wsServer->config.port = wsPort;
@@ -118,6 +119,7 @@ int main(int argc, char** argv) {
         // Simple-WebSocket-Server expects a regex endpoint; wrap /path as ^/path$
         std::string wsPattern = wsPath;
         if (wsPattern.empty() || wsPattern.front() != '^') wsPattern = "^" + wsPattern + "$";
+        wsRegex = wsPattern; // keep compiled regex key for lookups
 
         auto &ep = wsServer->endpoint[wsPattern];
 
@@ -223,7 +225,7 @@ int main(int argc, char** argv) {
                         std::lock_guard<std::mutex> lock(wsMutex);
                         latestJson = snap;
                     }
-                    auto it_ep = wsServer->endpoint.find(wsPattern);
+                    auto it_ep = wsServer->endpoint.find(wsRegex);
                     if (it_ep != wsServer->endpoint.end()) {
                         for (auto &c2 : it_ep->second.get_connections()) {
                             c2->send(snap);
@@ -330,7 +332,7 @@ int main(int argc, char** argv) {
             latestJson = jsonOut;
         }
         if (wsServer) {
-            auto endpoint_it = wsServer->endpoint.find(wsPath);
+            auto endpoint_it = wsServer->endpoint.find(wsRegex);
             if (endpoint_it != wsServer->endpoint.end()) {
                 auto &endpoint = endpoint_it->second;
                 for (auto &conn : endpoint.get_connections()) {
@@ -353,7 +355,7 @@ int main(int argc, char** argv) {
             }
             delta += "}\n";
             if (wsServer) {
-                auto endpoint_it2 = wsServer->endpoint.find(wsPath);
+                auto endpoint_it2 = wsServer->endpoint.find(wsRegex);
                 if (endpoint_it2 != wsServer->endpoint.end()) {
                     auto &endpoint2 = endpoint_it2->second;
                     for (auto &conn : endpoint2.get_connections()) {

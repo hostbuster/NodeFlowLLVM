@@ -322,21 +322,22 @@ void FlowEngine::execute() {
     ++evalGeneration;
 
     auto makeKey = [](const std::string& nodeId, const std::string& portId) { return nodeId + ":" + portId; };
-    // Seed SoA with last outputs so downstream consumers see previous values if no new events
-    for (const auto& node : nodes) {
-        for (const auto& output : node.outputs) {
-            int hOut = getPortHandle(node.id, output.id, "output");
-            if (hOut >= 0 && static_cast<size_t>(hOut) < portValues.size()) this->portValues[hOut] = output.value;
+    // Only on cold start do we seed SoA and perform initial propagation; subsequent ticks are dirty-driven
+    if (coldStart) {
+        for (const auto& node : nodes) {
+            for (const auto& output : node.outputs) {
+                int hOut = getPortHandle(node.id, output.id, "output");
+                if (hOut >= 0 && static_cast<size_t>(hOut) < portValues.size()) this->portValues[hOut] = output.value;
+            }
         }
-    }
-    // Initial propagation via handle adjacency
-    for (const auto &pd : portDescs) {
-        if (pd.direction != "output") continue;
-        int hOut = pd.handle;
-        for (int hIn : outToIn[hOut]) {
-            if (hIn >= 0 && static_cast<size_t>(hIn) < portValues.size()) {
-                this->portValues[hIn] = this->portValues[hOut];
-                (void)portDescs; // SoA propagation only; map no longer used
+        for (const auto &pd : portDescs) {
+            if (pd.direction != "output") continue;
+            int hOut = pd.handle;
+            for (int hIn : outToIn[hOut]) {
+                if (hIn >= 0 && static_cast<size_t>(hIn) < portValues.size()) {
+                    this->portValues[hIn] = this->portValues[hOut];
+                    (void)portDescs; // SoA propagation only; map no longer used
+                }
             }
         }
     }
@@ -491,8 +492,8 @@ void FlowEngine::execute() {
         } else {
             // Unknown node type: leave outputs unchanged (no-op)
         }
-        enqueueDependents(it->id);
         // Mark node changed if primary output changed compared to previous
+        bool changedPrimary = false;
         if (!it->outputs.empty() && hasPrev0) {
             const auto &new0 = it->outputs[0].value;
             bool changed = prevOut0.index() != new0.index();
@@ -502,8 +503,10 @@ void FlowEngine::execute() {
                 else if (std::holds_alternative<int>(new0)) changed = std::get<int>(prevOut0) != std::get<int>(new0);
                 else if (std::holds_alternative<std::string>(new0)) changed = std::get<std::string>(prevOut0) != std::get<std::string>(new0);
             }
-            if (changed) outputChangedStamp[it->id] = evalGeneration;
+            if (changed) { outputChangedStamp[it->id] = evalGeneration; changedPrimary = true; }
         }
+        // Enqueue dependents only when outputs changed
+        if (changedPrimary) enqueueDependents(it->id);
     };
 
     // Deterministic scheduling: first time run full topo, then ready-queue
