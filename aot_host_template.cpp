@@ -158,9 +158,12 @@ int main(int argc, char** argv) {
     std::mutex hostMutex; // guards in/out/state during WS access
     std::string latestJson;
     std::function<std::string()> buildSnapshot;
+    std::function<std::string()> buildDelta;
     std::string wsRegex; // compiled regex key used in endpoint map
     // Expose input field lookup beyond the WS init block so buildSnapshot remains valid
     std::unordered_map<std::string, std::pair<size_t,const char*>> inputLookup;
+    // Track last-sent output values for delta emission
+    std::unordered_map<int,double> lastOutByHandle;
     if (wsEnable) {
         wsServer = std::make_unique<WsServer>();
         wsServer->config.port = wsPort;
@@ -214,6 +217,41 @@ int main(int argc, char** argv) {
             }
             js += "}\n";
             return js;
+        };
+        buildDelta = [&](){
+            // Builds {"type":"delta", "node:port": value, ...} only for changed outputs
+            std::string js;
+            int changed = 0;
+            {
+                std::lock_guard<std::mutex> lock(hostMutex);
+                for (int i = 0; i < NODEFLOW_NUM_PORTS; ++i) {
+                    const auto &p = NODEFLOW_PORTS[i];
+                    if (!p.is_output) continue;
+                    double v = 0.0;
+                    auto itIn = inputLookup.find(p.nodeId);
+                    if (itIn != inputLookup.end()) {
+                        const auto &fld = itIn->second;
+                        const char* base = reinterpret_cast<const char*>(&in);
+                        const char* loc = base + fld.first;
+                        if (std::strcmp(fld.second, "int") == 0)      v = (double)(*reinterpret_cast<const int*>(loc));
+                        else if (std::strcmp(fld.second, "double") == 0) v = (*reinterpret_cast<const double*>(loc));
+                        else                                             v = (double)(*reinterpret_cast<const float*>(loc));
+                    } else {
+                        v = nodeflow_get_output(p.handle, &out, &state);
+                    }
+                    auto itPrev = lastOutByHandle.find(p.handle);
+                    bool isChanged = (itPrev == lastOutByHandle.end()) || (std::abs(itPrev->second - v) > 1e-9);
+                    if (isChanged) {
+                        if (changed == 0) js = "{\"type\":\"delta\""; // start object lazily
+                        js += ",\""; js += p.nodeId; js += ":"; js += p.portId; js += "\":";
+                        js += fmt::format("{:.3f}", v);
+                        ++changed;
+                        lastOutByHandle[p.handle] = v;
+                    }
+                }
+            }
+            if (changed > 0) { js += "}\n"; return js; }
+            return std::string{};
         };
         auto has = [&](const std::string &data, const char* key){ return data.find(key) != std::string::npos; };
         auto getStr = [&](const std::string &data, const char* key)->std::string{
@@ -282,6 +320,15 @@ int main(int argc, char** argv) {
                         auto it = wsServer->endpoint.find(wsRegex);
                         if (it != wsServer->endpoint.end()) {
                             for (auto &c : it->second.get_connections()) c->send(snap);
+                        }
+                        if (buildDelta) {
+                            std::string delta = buildDelta();
+                            if (!delta.empty()) {
+                                auto it2 = wsServer->endpoint.find(wsRegex);
+                                if (it2 != wsServer->endpoint.end()) {
+                                    for (auto &c : it2->second.get_connections()) c->send(delta);
+                                }
+                            }
                         }
                     }
                 } else if (type == "subscribe") {
@@ -371,6 +418,15 @@ int main(int argc, char** argv) {
                 auto it = wsServer->endpoint.find(wsRegex);
                 if (it != wsServer->endpoint.end()) {
                     for (auto &c : it->second.get_connections()) c->send(snap);
+                }
+                if (buildDelta) {
+                    std::string delta = buildDelta();
+                    if (!delta.empty()) {
+                        auto it2 = wsServer->endpoint.find(wsRegex);
+                        if (it2 != wsServer->endpoint.end()) {
+                            for (auto &c : it2->second.get_connections()) c->send(delta);
+                        }
+                    }
                 }
                 std::this_thread::sleep_for(100ms);
             }
