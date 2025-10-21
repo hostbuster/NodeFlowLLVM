@@ -81,6 +81,13 @@ int main(int argc, char** argv) {
     std::vector<std::string> setArgs;
     bool list = false;
 
+    // Benchmark flags
+    bool bench = false;           // compute-only (no WS)
+    int benchRate = 0;            // Hz input feeder
+    int benchDuration = 0;        // seconds
+    std::string perfOut;          // NDJSON file for perf summaries
+    int perfIntervalMs = 1000;    // summary period
+
     try {
         CLI::App app{"NodeFlow AOT Host"};
         app.add_option("--rate", rateHz, "Tick rate Hz (optional)");
@@ -90,6 +97,12 @@ int main(int argc, char** argv) {
         app.add_option("--ws-path", wsPath, "WebSocket path (default /stream)");
         app.add_option("--set", setArgs, "Set input as node=value (repeatable)")->expected(-1);
         app.add_flag("--list", list, "List input fields for this flow and exit");
+        // Bench/perf
+        app.add_flag("--bench", bench, "Compute-only benchmark (disable WS)");
+        app.add_option("--bench-rate", benchRate, "Feeder rate Hz (compute-only)");
+        app.add_option("--bench-duration", benchDuration, "Benchmark duration seconds");
+        app.add_option("--perf-out", perfOut, "Write NDJSON perf summaries to file");
+        app.add_option("--perf-interval", perfIntervalMs, "Summary interval ms");
         app.set_help_all_flag("--help-all", "Show all help");
         app.allow_extras();
         app.parse(argc, argv);
@@ -119,24 +132,71 @@ int main(int argc, char** argv) {
     for (const auto &kv : sets) {
         const std::string &node = kv.first;
         double val = kv.second;
-        bool applied = false;
         for (int i = 0; i < NODEFLOW_NUM_INPUT_FIELDS; ++i) {
             const auto &f = NODEFLOW_INPUT_FIELDS[i];
             if (node == f.nodeId) {
                 char* base = reinterpret_cast<char*>(&in);
                 char* loc = base + f.offset;
-                // f.dtype is one of "int","double","float"
-                if (std::strcmp(f.dtype, "int") == 0) {
-                    *reinterpret_cast<int*>(loc) = static_cast<int>(val);
-                } else if (std::strcmp(f.dtype, "double") == 0) {
-                    *reinterpret_cast<double*>(loc) = static_cast<double>(val);
-                } else { // float default
-                    *reinterpret_cast<float*>(loc) = static_cast<float>(val);
-                }
-                applied = true;
+                if (std::strcmp(f.dtype, "int") == 0)      *reinterpret_cast<int*>(loc) = static_cast<int>(val);
+                else if (std::strcmp(f.dtype, "double") == 0) *reinterpret_cast<double*>(loc) = static_cast<double>(val);
+                else                                           *reinterpret_cast<float*>(loc) = static_cast<float>(val);
             }
         }
-        if (!applied) fmt::print("[host] warn: no input field for '{}'\n", node);
+    }
+
+    // Perf state
+    using clk = std::chrono::steady_clock;
+    auto tLast = clk::now();
+    unsigned long long evalCount = 0, evalNsAccum = 0, evalNsMin = ~0ull, evalNsMax = 0;
+    auto flushPerf = [&](bool force){
+        if (!perfOut.empty()) {
+            static FILE* fp = nullptr;
+            if (!fp) fp = std::fopen(perfOut.c_str(), "w");
+            if (fp) {
+                // One summary line
+                std::fprintf(fp, "{\"type\":\"perf\",\"evalCount\":%llu,\"evalTimeNsAccum\":%llu,\"evalTimeNsMin\":%llu,\"evalTimeNsMax\":%llu}\n",
+                             evalCount, evalNsAccum, evalNsMin, evalNsMax);
+                if (force) std::fflush(fp);
+            }
+        }
+        // reset accumulators each interval
+        evalCount = 0; evalNsAccum = 0; evalNsMin = ~0ull; evalNsMax = 0;
+    };
+
+    // Bench compute-only mode
+    if (bench) {
+        using namespace std::chrono;
+        const auto tick = (benchRate > 0) ? milliseconds(1000 / benchRate) : milliseconds(0);
+        const auto endAt = (benchDuration > 0) ? clk::now() + seconds(benchDuration) : time_point<clk>::max();
+        const int inputCount = NODEFLOW_NUM_INPUT_FIELDS;
+        int roundRobin = 0;
+        while (clk::now() < endAt) {
+            auto t0 = clk::now();
+            // simple feeder: round-robin bump
+            if (benchRate > 0 && inputCount > 0) {
+                const auto &f = NODEFLOW_INPUT_FIELDS[roundRobin % inputCount];
+                char* base = reinterpret_cast<char*>(&in);
+                char* loc = base + f.offset;
+                // flip 0/1 (or 0/2) to create changes
+                double newv = 0.0;
+                if (std::strcmp(f.dtype, "int") == 0) {
+                    int v = *reinterpret_cast<int*>(loc); newv = (v==0)?1:0; *reinterpret_cast<int*>(loc) = (int)newv;
+                } else if (std::strcmp(f.dtype, "double") == 0) {
+                    double v = *reinterpret_cast<double*>(loc); newv = (v==0.0)?1.0:0.0; *reinterpret_cast<double*>(loc) = newv;
+                } else {
+                    float v = *reinterpret_cast<float*>(loc); newv = (v==0.0f)?1.0f:0.0f; *reinterpret_cast<float*>(loc) = (float)newv;
+                }
+                ++roundRobin;
+            }
+            nodeflow_step(&in, &out, &state);
+            auto t1 = clk::now();
+            auto ns = (unsigned long long)duration_cast<nanoseconds>(t1 - t0).count();
+            ++evalCount; evalNsAccum += ns; if (ns < evalNsMin) evalNsMin = ns; if (ns > evalNsMax) evalNsMax = ns;
+            if (benchRate > 0 && tick.count() > 0) std::this_thread::sleep_for(tick);
+            if (duration_cast<milliseconds>(clk::now() - tLast).count() >= perfIntervalMs) { flushPerf(true); tLast = clk::now(); }
+        }
+        flushPerf(true);
+        return 0;
     }
 
     // Optional loop: --rate <Hz> and --duration <seconds> (already parsed by CLI)

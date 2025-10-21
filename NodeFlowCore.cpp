@@ -318,6 +318,7 @@ void FlowEngine::computeExecutionOrder() {
 // Evaluate the graph once (non-blocking). Seeds previous outputs, performs
 // handle-based propagation, and executes nodes in topological order.
 void FlowEngine::execute() {
+    auto t0 = std::chrono::steady_clock::now();
     // bump evaluation generation
     ++evalGeneration;
 
@@ -511,7 +512,7 @@ void FlowEngine::execute() {
 
     // Deterministic scheduling: first time run full topo, then ready-queue
     if (coldStart) {
-        for (const auto& nodeId : executionOrder) processNode(nodeId);
+        for (const auto& nodeId : executionOrder) { processNode(nodeId); ++perf.nodesEvaluated; }
         readyQueue.clear();
         coldStart = false;
     } else {
@@ -519,8 +520,16 @@ void FlowEngine::execute() {
             auto nodeId = readyQueue.front();
             readyQueue.erase(readyQueue.begin());
             processNode(nodeId);
+            ++perf.nodesEvaluated;
+            if (readyQueue.size() > perf.readyQueueMax) perf.readyQueueMax = readyQueue.size();
         }
     }
+    auto t1 = std::chrono::steady_clock::now();
+    auto ns = (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    ++perf.evalCount;
+    perf.evalTimeNsAccum += ns;
+    if (ns < perf.evalTimeNsMin) perf.evalTimeNsMin = ns;
+    if (ns > perf.evalTimeNsMax) perf.evalTimeNsMax = ns;
 }
 
 void FlowEngine::enqueueNode(const NodeId& id) {
@@ -534,6 +543,7 @@ void FlowEngine::enqueueNode(const NodeId& id) {
         if (ia != ib) return ia < ib;
         return a < b;
     });
+    ++perf.dependentsEnqueued;
 }
 
 void FlowEngine::enqueueDependents(const NodeId& id) {

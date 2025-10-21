@@ -100,6 +100,22 @@ public:
     std::vector<std::tuple<NodeId, PortId, Value>> getPortDeltasChangedSince(Generation lastSnapshotGen) const;
     Generation currentEvalGeneration() const { return evalGeneration; }
 
+    // Performance counters (lightweight; zero-alloc, resettable)
+    struct PerfStats {
+        unsigned long long evalCount = 0;
+        unsigned long long nodesEvaluated = 0;
+        unsigned long long dependentsEnqueued = 0;
+        unsigned long long readyQueueMax = 0;
+        unsigned long long evalTimeNsAccum = 0; // total
+        unsigned long long evalTimeNsMin = (unsigned long long)-1;
+        unsigned long long evalTimeNsMax = 0;
+    };
+    PerfStats getAndResetPerfStats() {
+        PerfStats out = perf;
+        perf = PerfStats{};
+        return out;
+    }
+
 private:
     std::vector<Node> nodes;
     std::vector<Connection> connections;
@@ -125,6 +141,9 @@ private:
     std::vector<NodeId> readyQueue;
     std::unordered_map<NodeId, Generation> readyStamp;
     bool coldStart = true;
+
+    // Perf counters (mutated inside execute and enqueue)
+    PerfStats perf;
 
     void enqueueNode(const NodeId& id);
     void enqueueDependents(const NodeId& id);

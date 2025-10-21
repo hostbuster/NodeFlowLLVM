@@ -34,6 +34,11 @@ int main(int argc, char** argv) {
     std::string outDir;
     int wsPort = 9002;
     std::string wsPath = "/stream";
+    bool bench = false;            // compute-only benchmark disables WS
+    int benchRate = 0;             // Hz feeder
+    int benchDuration = 0;         // seconds
+    std::string perfOut;           // NDJSON file
+    int perfIntervalMs = 1000;     // summary interval
     CLI::App app{"NodeFlowCore"};
     try {
         app.add_option("--flow", flowPath, "Path to flow JSON file");
@@ -41,6 +46,12 @@ int main(int argc, char** argv) {
         app.add_option("--out-dir", outDir, "Directory to write generated AOT files");
         app.add_option("--ws-port", wsPort, "WebSocket port");
         app.add_option("--ws-path", wsPath, "WebSocket path (e.g., /stream)");
+        // Bench/perf
+        app.add_flag("--bench", bench, "Compute-only benchmark (disable WS)");
+        app.add_option("--bench-rate", benchRate, "Feeder rate Hz for benchmark");
+        app.add_option("--bench-duration", benchDuration, "Benchmark duration seconds");
+        app.add_option("--perf-out", perfOut, "Write NDJSON perf summaries to file");
+        app.add_option("--perf-interval", perfIntervalMs, "Perf summary interval ms");
         
         app.allow_extras(false);
         app.validate_positionals();
@@ -103,6 +114,54 @@ int main(int argc, char** argv) {
     // Initialize ncurses (optional)
     // Startup message
     fmt::print("NodeFlowCore started. WS=on, flow='{}'\n", flowPath);
+
+    // Bench compute-only mode: disable WS; feed inputs and measure
+    if (bench) {
+        using clk = std::chrono::steady_clock;
+        auto tLast = clk::now();
+        unsigned long long evalCount = 0, evalNsAccum = 0, evalNsMin = ~0ull, evalNsMax = 0;
+        auto flushPerf = [&](bool force){
+            if (!perfOut.empty()) {
+                static FILE* fp = nullptr;
+                if (!fp) fp = std::fopen(perfOut.c_str(), "w");
+                if (fp) {
+                    auto ps = engine.getAndResetPerfStats();
+                    std::fprintf(fp,
+                        "{\"type\":\"perf\",\"evalCount\":%llu,\"evalTimeNsAccum\":%llu,\"evalTimeNsMin\":%llu,\"evalTimeNsMax\":%llu,\"nodesEvaluated\":%llu,\"dependentsEnqueued\":%llu,\"readyQueueMax\":%llu}\n",
+                        evalCount, evalNsAccum, evalNsMin, evalNsMax,
+                        ps.nodesEvaluated, ps.dependentsEnqueued, ps.readyQueueMax);
+                    if (force) std::fflush(fp);
+                }
+            }
+            evalCount = 0; evalNsAccum = 0; evalNsMin = ~0ull; evalNsMax = 0;
+        };
+        using namespace std::chrono;
+        const auto tick = (benchRate > 0) ? milliseconds(1000 / benchRate) : milliseconds(0);
+        const auto endAt = (benchDuration > 0) ? clk::now() + seconds(benchDuration) : time_point<clk>::max();
+        // Choose device triggers (outputs) as inputs; set round-robin
+        std::vector<std::string> inputNodes;
+        for (const auto &n : engine.getNodeDescs()) if (n.type == "DeviceTrigger") inputNodes.push_back(n.id);
+        if (inputNodes.empty()) for (const auto &n : engine.getNodeDescs()) inputNodes.push_back(n.id);
+        size_t rr = 0;
+        while (clk::now() < endAt) {
+            auto t0 = clk::now();
+            if (!inputNodes.empty()) {
+                const auto &node = inputNodes[rr % inputNodes.size()];
+                float oldv = 0.0f;
+                engine.setNodeValue(node, oldv); // ensure exists
+                engine.setNodeValue(node, (rr & 1) ? 1.0f : 0.0f);
+                ++rr;
+            }
+            engine.execute();
+            auto t1 = clk::now();
+            auto ns = (unsigned long long)duration_cast<nanoseconds>(t1 - t0).count();
+            ++evalCount; evalNsAccum += ns; if (ns < evalNsMin) evalNsMin = ns; if (ns > evalNsMax) evalNsMax = ns;
+            if (benchRate > 0 && tick.count() > 0) std::this_thread::sleep_for(tick);
+            if (duration_cast<milliseconds>(clk::now() - tLast).count() >= perfIntervalMs) { flushPerf(true); tLast = clk::now(); }
+        }
+        flushPerf(true);
+        return 0;
+    }
 
     // WebSocket server (headless IPC)
     using WsServer = SimpleWeb::SocketServer<SimpleWeb::WS>;
