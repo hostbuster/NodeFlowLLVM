@@ -40,6 +40,12 @@ int main(int argc, char** argv) {
     int benchDuration = 0;         // seconds
     std::string perfOut;           // NDJSON file
     int perfIntervalMs = 1000;     // summary interval
+    // WS delta aggregation
+    int wsDeltaRateHz = 60;        // 0 = immediate
+    int wsDeltaMaxBatch = 512;
+    double wsDeltaEpsilon = 0.0;   // 0 disables epsilon filtering
+    int wsHeartbeatSec = 15;       // 0 disables heartbeat
+    bool wsDeltaFast = true;       // send immediate tiny delta on set
     CLI::App app{"NodeFlowCore"};
     try {
         app.add_option("--flow", flowPath, "Path to flow JSON file");
@@ -54,6 +60,12 @@ int main(int argc, char** argv) {
         app.add_option("--bench-duration", benchDuration, "Benchmark duration seconds");
         app.add_option("--perf-out", perfOut, "Write NDJSON perf summaries to file");
         app.add_option("--perf-interval", perfIntervalMs, "Perf summary interval ms");
+        // WS delta aggregation
+        app.add_option("--ws-delta-rate-hz", wsDeltaRateHz, "Delta flush rate in Hz (0=immediate)");
+        app.add_option("--ws-delta-max-batch", wsDeltaMaxBatch, "Max keys per delta batch");
+        app.add_option("--ws-delta-epsilon", wsDeltaEpsilon, "Float epsilon to suppress tiny changes (0=off)");
+        app.add_option("--ws-heartbeat-sec", wsHeartbeatSec, "Send heartbeat every N seconds when idle (0=off)");
+        app.add_flag("--ws-delta-fast", wsDeltaFast, "Send immediate tiny delta for set operations");
         
         app.allow_extras(false);
         app.validate_positionals();
@@ -172,6 +184,10 @@ int main(int argc, char** argv) {
     std::mutex wsMutex;
     std::mutex engineMutex;
     std::string latestJson; // last snapshot/delta, for simple demo
+    // Delta aggregation state
+    std::unordered_map<std::string, std::string> pendingDelta;
+    auto lastFlush = std::chrono::steady_clock::now();
+    auto lastActivity = std::chrono::steady_clock::now();
     std::string wsRegex; // compiled endpoint regex key for lookups
     {
         wsServer = std::make_unique<WsServer>();
@@ -292,6 +308,7 @@ int main(int argc, char** argv) {
                             c2->send(snap);
                         }
                     }
+                    lastActivity = std::chrono::steady_clock::now();
                 };
                 if (type == "set") {
                     float value = static_cast<float>(getNum("value"));
@@ -314,7 +331,33 @@ int main(int argc, char** argv) {
                         }
                     }
                     conn->send("{\"ok\":true}\n");
-                    broadcastSnapshot();
+                    if (wsDeltaFast) {
+                        // Try to send a tiny delta immediately for responsiveness
+                        std::string node;
+                        if (hasKey("handle")) {
+                            int h2 = static_cast<int>(getNum("handle"));
+                            const auto &ports2 = engine.getPortDescs();
+                            if (h2 >= 0 && static_cast<size_t>(h2) < ports2.size()) node = ports2[h2].nodeId;
+                        } else {
+                            node = getStr("node");
+                        }
+                        // Prefer canonical key nodeId:portId for deltas
+                        std::string key = node;
+                        const auto &ports2b = engine.getPortDescs();
+                        for (const auto &p2 : ports2b) {
+                            if (p2.nodeId == node && p2.direction == "output") { key = node + ":" + p2.portId; break; }
+                        }
+                        // Value as formatted JSON number
+                        std::string val = fmt::format("{:.3f}", value);
+                        std::string delta = std::string("{\"type\":\"delta\",\"") + key + "\":" + val + "}\n";
+                        auto it_ep = wsServer->endpoint.find(wsRegex);
+                        if (it_ep != wsServer->endpoint.end()) {
+                            for (auto &c2 : it_ep->second.get_connections()) c2->send(delta);
+                        }
+                        lastActivity = std::chrono::steady_clock::now();
+                    } else {
+                        broadcastSnapshot();
+                    }
                 } else if (type == "config") {
                     auto node = getStr("node");
                     int minI = static_cast<int>(getNum("min_interval"));
@@ -402,30 +445,62 @@ int main(int argc, char** argv) {
             }
         }
 
-        // Delta emission using generation counters (per-port)
-        auto snapGen = engine.beginSnapshot();
+        // Delta aggregation using evaluation generation counters (per-port)
+        auto curEvalGen = engine.currentEvalGeneration();
         auto deltas = engine.getPortDeltasChangedSince(lastSnapshotGen);
         if (!deltas.empty()) {
-            std::string delta = "{\"type\":\"delta\"";
             for (const auto &t : deltas) {
                 const auto &nodeId = std::get<0>(t);
                 const auto &portId = std::get<1>(t);
                 const auto &val = std::get<2>(t);
-                delta += ",\""; delta += nodeId; delta += ":"; delta += portId; delta += "\":";
-                delta += valueToJsonLoop(val);
+                // Build canonical key and formatted value
+                std::string key = nodeId + ":" + portId;
+                std::string v = valueToJsonLoop(val);
+                // Optional epsilon suppression for floats
+                if (wsDeltaEpsilon > 0.0) {
+                    try {
+                        double dv = std::stod(v);
+                        auto itPrev = pendingDelta.find(key);
+                        if (itPrev != pendingDelta.end()) {
+                            double pv = std::stod(itPrev->second);
+                            if (std::abs(dv - pv) < wsDeltaEpsilon) continue;
+                        }
+                    } catch(...) {}
+                }
+                pendingDelta[key] = v;
+            }
+            lastActivity = std::chrono::steady_clock::now();
+        }
+        // Advance watermark to current evaluation generation
+        lastSnapshotGen = curEvalGen;
+
+        // Flush window / heartbeat
+        auto now = std::chrono::steady_clock::now();
+        bool timeToFlush = (wsDeltaRateHz == 0) ? !pendingDelta.empty() : (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastFlush).count() >= (1000 / std::max(1, wsDeltaRateHz)));
+        if (wsServer && timeToFlush && !pendingDelta.empty()) {
+            int count = 0;
+            std::string delta = "{\"type\":\"delta\"";
+            for (const auto &kv : pendingDelta) {
+                if (count >= wsDeltaMaxBatch) break;
+                delta += ",\"" + kv.first + "\":" + kv.second;
+                ++count;
             }
             delta += "}\n";
-            if (wsServer) {
-                auto endpoint_it2 = wsServer->endpoint.find(wsRegex);
-                if (endpoint_it2 != wsServer->endpoint.end()) {
-                    auto &endpoint2 = endpoint_it2->second;
-                    for (auto &conn : endpoint2.get_connections()) {
-                        conn->send(delta);
-                    }
-                }
+            auto endpoint_it2 = wsServer->endpoint.find(wsRegex);
+            if (endpoint_it2 != wsServer->endpoint.end()) {
+                auto &endpoint2 = endpoint_it2->second;
+                for (auto &conn : endpoint2.get_connections()) conn->send(delta);
             }
+            pendingDelta.clear();
+            lastFlush = now;
+            lastActivity = now;
+        } else if (wsServer && wsHeartbeatSec > 0 && std::chrono::duration_cast<std::chrono::seconds>(now - lastActivity).count() >= wsHeartbeatSec) {
+            auto endpoint_it2 = wsServer->endpoint.find(wsRegex);
+            if (endpoint_it2 != wsServer->endpoint.end()) {
+                for (auto &conn : endpoint_it2->second.get_connections()) conn->send("{\"type\":\"heartbeat\"}\n");
+            }
+            lastActivity = now;
         }
-        lastSnapshotGen = snapGen;
 
         // Small delay to prevent CPU overuse
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

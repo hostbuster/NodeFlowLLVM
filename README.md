@@ -1,33 +1,25 @@
 ## NodeFlow: Asynchronous Dataflow Framework
 
-NodeFlowLLVM is a C++ framework for creating and executing dataflow graphs with asynchronous nodes, designed to simulate real-time systems like device triggers. It compiles flows to standalone executables via LLVM for high performance and portability. The demo shows three async inputs (key1, key2, random1) whose values are summed in real-time; devices are simulated via a WebSocket-powered web UI.
+NodeFlowLLVM is a C++ framework for creating and executing dataflow graphs with asynchronous nodes, designed to simulate real-time systems like device triggers. The core is headless and exposes a WebSocket (WS) interface; a minimal web UI simulates devices. We also support Ahead-of-Time (AOT) generation of small step-function libraries (C++ and LLVM-IR variants) for embedding.
 
 ### Key Features
 
-- **Asynchronous Nodes**: Event-driven inputs (keyboard, timers) implemented with coroutines for non-blocking execution.
-- **JSON Configuration**: Flows are defined in `devicetrigger_addition.json` (nodes, connections, parameters like key triggers and random intervals).
-- **Real-Time Updates**: Outputs update dynamically on key presses and on periodic random triggers.
-- **LLVM Compilation**: Generates optimized native code with a DSL-like `run_flow` entry point for easy integration.
-- **WebSocket Streaming (optional)**: Stream node updates and sums to a web UI via Simple-WebSocket-Server.
-  - The web UI also sends input events (simulate devices) to the core.
+- **Headless core**: No ncurses/UI in the runtime; simulation is via WS from the web client.
+- **JSON Configuration**: Flows are defined in `*.json` (nodes, connections, parameters). The example is `devicetrigger_addition.json`.
+- **SoA engine & determinism**: Handle-indexed arrays, generation counters, and a deterministic ready-queue scheduler.
+- **WebSocket IPC**: Schema/snapshot/delta streaming to a web UI; UI can send `set` commands back.
+- **AOT step libraries**: Generate `<base>_step` (typed C++) or `<base>_step_llvm` (LLVM-IR) for embedding.
 
-### Why LLVM + a DSL
+### Why AOT (and optionally LLVM)
 
-- **Performance**: LLVM optimizations (e.g., `fadd` for float addition) approach hand-written performance.
-- **Portability**: Targets any LLVM-supported platform (x86, ARM, etc.) without rewriting code.
-- **DSL Simplicity**: A generated `run_flow` function abstracts graphs, coroutines, and event loops behind a simple call interface.
-- **Flexibility**: Coroutine support enables async nodes that suspend/resume efficiently.
+- **Performance**: Typed, per-graph code with direct loads/stores; no string/maps/variant dispatch in the hot path.
+- **Embeddability**: A tiny C ABI (`nodeflow_step`) driven by a host; easy to integrate.
+- **Specialization**: Optionally compile LLVM IR for target-tuned kernels and multi-step variants.
 
-This eliminates manual event-loop coding and enables rapid prototyping of complex async systems.
+### Dependencies (macOS)
 
-### Potential Enhancements
-
-- **GUI Integration**: Replace ncurses with a Cinder-based macOS UI to visualize node states.
-- **Extended Types**: Add `async_int`, `async_double`, `async_string` for broader use-cases.
-- **Persistent State**: Keep node values across runs for stateful behavior (e.g., cumulative sums).
-- **Real Devices**: Swap keyboard/random inputs for actual device signals (e.g., sensors over TCP).
-- **Optimizations**: Apply LLVM passes (inlining, unrolling) for further gains.
-- **Parallelism**: Explore multi-threaded or distributed node processing.
+- Homebrew packages: `nlohmann-json`, `asio`, `openssl@3`, `cmake`, `fmt`, `llvm` (optional for IR toolchain)
+- CLI11 is fetched automatically if not installed
 
 ### Build and Run (macOS)
 
@@ -38,7 +30,7 @@ This eliminates manual event-loop coding and enables rapid prototyping of comple
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
 # Dependencies
-brew install llvm nlohmann-json asio openssl@3 cmake fmt
+brew install nlohmann-json asio openssl@3 cmake fmt llvm
 ```
 
 Note: On macOS Apple Silicon, prefer Homebrew at `/opt/homebrew`. We link against `openssl@3` and use standalone `asio`.
@@ -68,35 +60,44 @@ make -j
   - Use the slider for `random1` (0–100) to send updates.
   - The UI displays values received from the core and the `add1` result.
 
-### New: Command-line flags
+### Runtime CLI
 
-- `--flow <path>`: specify the flow JSON file. If omitted, defaults to `devicetrigger_addition.json` with fallback search in `.`/`..`/`../..`.
-- `--build-aot`: generate an AOT step-function library and exit. Files are named `<basename>_step.h/.cpp` (basename from the JSON filename).
-- `--out-dir <dir>`: when used with `--build-aot`, write generated files into the directory.
-  
-WebSockets are always enabled; the server runs by default. You can configure:
-- `--ws-port <int>`: port (default 9002)
-- `--ws-path <string>`: path (default `/stream`)
+- Core options
+  - `--flow <path>`: flow JSON (default `devicetrigger_addition.json`, fallback search `.` `..` `../..`).
+  - `--build-aot`: generate AOT step library and exit.
+  - `--aot-llvm`: use LLVM-style backend for AOT generation (emits `<base>_step.ll` + glue).
+  - `--out-dir <dir>`: output directory for AOT files.
+- WebSocket options
+  - `--ws-port <int>` (default 9002)
+  - `--ws-path <string>` (default `/stream`)
+- Benchmark & perf
+  - `--bench`: compute-only mode (no WS); feeds inputs in-process.
+  - `--bench-rate <hz>`, `--bench-duration <sec>`
+  - `--perf-out <file.ndjson>`, `--perf-interval <ms>`
+- Delta aggregation (WS)
+  - `--ws-delta-rate-hz <hz>`: 0=immediate (default 60)
+  - `--ws-delta-max-batch <n>`: cap keys per delta (default 512)
+  - `--ws-delta-epsilon <float>`: drop tiny float diffs (default 0)
+  - `--ws-heartbeat-sec <sec>`: idle heartbeat (default 15)
+  - `--ws-delta-fast`: send an immediate tiny delta on set (default on)
 
-Examples:
-
+Example:
 ```bash
-# Generate AOT-only artifacts (no runtime launch), writing to build/aot
-./NodeFlowCore --flow devicetrigger_addition.json --build-aot --out-dir build/aot
+./build/NodeFlowCore --flow devicetrigger_addition.json --ws-delta-rate-hz 60 --ws-delta-fast
 ```
 
 ### AOT step library (Option B)
 
 When `--build-aot` is used, the engine emits a small, JSON-driven step-function interface:
-- `<basename>_step.h` defines:
-  - `NodeFlowInputs` (fields for each `DeviceTrigger` node)
-  - `NodeFlowOutputs` (fields for sink nodes)
+- `<base>_step.h/.cpp` (typed C++):
+  - `NodeFlowInputs` (one field per `DeviceTrigger`)
+  - `NodeFlowOutputs` (one field per sink)
   - `nodeflow_step(const NodeFlowInputs*, NodeFlowOutputs*, NodeFlowState*)`
-- `<basename>_step.cpp` implements evaluation in topological order.
+- With `--aot-llvm`, also emit `<base>_step.ll` and `<base>_step_desc.cpp`; CMake builds `<base>_step_llvm` and `<base>_host_llvm`.
 
 Build integration:
-- CMake auto-builds any `*_step.cpp` in the source dir into a static library `build/lib<basename>_step.a`.
-- A minimal host example `<basename>_host` is built to demonstrate calling `nodeflow_step`.
+- CMake auto-builds any `*_step.cpp` into `lib<base>_step.a` and `<base>_host`.
+- For LLVM IR, CMake compiles `*_step.ll` and links with `<base>_step_desc.cpp` into `<base>_step_llvm` and `<base>_host_llvm`.
 
 Usage:
 
@@ -110,13 +111,11 @@ cmake -S . -B build -DNODEFLOW_BUILD_RUNTIME=OFF && cmake --build build
 
 ### Runtime details
 
-- Non-blocking `DeviceTrigger` nodes:
-  - Inputs are driven by the web UI over WebSockets (no ncurses / keyboard dependency).
-  - Random can be driven from the UI; internal timers can be enabled per flow if needed.
-- Values persist between ticks; the sum updates when any input changes.
-- UI displays per-node values and both a calculated sum and the engine sum for verification.
+- Inputs are driven over WS by the UI; no ncurses/keyboard dependency.
+- Deterministic ready-queue scheduler; SoA storage; generation counters for O(1) dirty tracking.
+- Snapshots/deltas streamed generically from descriptors; UI binds dynamically.
 
-### WebSocket streaming + Web UI
+### WebSocket protocol + Web UI
 
 - Run runtime and open the web client:
 
@@ -125,27 +124,40 @@ cmake -S . -B build -DNODEFLOW_BUILD_RUNTIME=OFF && cmake --build build
 # Then open web/index.html (connects to ws://127.0.0.1:9002/stream)
 ```
 
-- The runtime broadcasts compact NDJSON-style JSON snapshots with current node values (key1, key2, random1) and `add1`.
+- Messages are NDJSON (one JSON per line):
+  - `{"type":"schema","ports":[{handle,nodeId,portId,direction,dtype},...]}`
+  - `{"type":"snapshot", "node:port": value, ...}` plus plain `"node"` alias for single-output nodes
+  - `{"type":"delta", "node:port": value, ...}` compact changes since last eval (coalesced)
+  - `{"ok":true}` small ACKs to control commands
+  - `{"type":"heartbeat"}` idle keepalive
+- Client → server controls:
+  - `{"type":"set","node":"key1","value":1.0}` or `{"type":"set","handle":0,"value":1.0}`
+  - `{"type":"subscribe"}` (optional)
+  - `{"type":"config","node":"random1","min_interval":100,"max_interval":300}`
 
 ### Build options
 
-- `-DNODEFLOW_CODEGEN=ON|OFF` (default ON): include the demo standalone codegen (`nodeflow_output`). We will iterate on LLVM/codegen next.
-- `-DNODEFLOW_BUILD_RUNTIME=ON|OFF` (default ON): build the interactive runtime `NodeFlowCore`.
+- `-DNODEFLOW_CODEGEN=ON|OFF` (default ON): include demo standalone codegen stub.
+- `-DNODEFLOW_BUILD_RUNTIME=ON|OFF` (default ON): build the interactive runtime.
+- `-DAOT_BACKEND_LLVM=ON|OFF` (default OFF): define `NODEFLOW_AOT_LLVM` for CLI plumbing.
 
 ### Files
 
 - `devicetrigger_addition.json`: Defines the dataflow (two keyboard triggers, one random trigger, one add node).
 - `NodeFlowCore.hpp`: Core framework structures and interfaces.
-- `NodeFlowCore.cpp`: Node execution and LLVM compilation.
-- `main.cpp`: JSON loading, WebSocket server, and codegen hooks.
+- `NodeFlowCore.cpp`: Node execution, SoA scheduler, AOT code generators (C++ & LLVM IR emitter).
+- `main.cpp`: CLI (CLI11), JSON load, WS server, generic schema/snapshot/delta, perf & delta aggregation.
+- `aot_host_template.cpp`: Minimal AOT host (CLI11); can run timed loops or serve WS. Supports `--help` and `--help-all`.
 - `CMakeLists.txt`: Build configuration for nlohmann-json, WebSockets (Asio + OpenSSL@3), and optional LLVM demo codegen.
 - `web/index.html`: Minimal WebSocket client to visualize live values.
 - `third_party/Simple-WebSocket-Server`: Header-only WebSocket server library (HTTP(S)/WS(S)) used for streaming.
 
 ### Notes & Troubleshooting
 
-- **LLVM in PATH**: Ensure Homebrew’s LLVM is first in PATH before running CMake.
-- **LLVM errors**: Confirm you are using Homebrew’s LLVM (`brew info llvm` for paths).
-- **Config file**: Ensure `devicetrigger_addition.json` is in the project root.
+- **OpenSSL arch**: Prefer `/opt/homebrew/opt/openssl@3` on Apple Silicon; see CMake diagnostics.
+- **Asio headers**: `brew install asio`; CMake prints the include dir if found.
+- **WS port busy**: `lsof -nP -iTCP:9002 -sTCP:LISTEN` then kill offending PID.
+- **Flow file**: Use `--flow /absolute/path.json` or place JSON at project root.
+
 
 NodeFlow showcases how LLVM and a DSL streamline async, event-driven applications on macOS, with a path to real-world device integration and scalable data processing.

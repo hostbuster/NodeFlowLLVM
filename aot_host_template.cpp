@@ -83,13 +83,19 @@ int main(int argc, char** argv) {
 
     // Benchmark flags
     bool bench = false;           // compute-only (no WS)
+    // WS delta aggregation
+    int wsDeltaRateHz = 60;      // 0 = immediate
+    int wsDeltaMaxBatch = 512;
+    double wsDeltaEpsilon = 0.0; // 0 disables epsilon
+    int wsHeartbeatSec = 15;     // 0 disables
+    bool wsDeltaFast = true;
     int benchRate = 0;            // Hz input feeder
     int benchDuration = 0;        // seconds
     std::string perfOut;          // NDJSON file for perf summaries
     int perfIntervalMs = 1000;    // summary period
 
+    CLI::App app{"NodeFlow AOT Host"};
     try {
-        CLI::App app{"NodeFlow AOT Host"};
         app.add_option("--rate", rateHz, "Tick rate Hz (optional)");
         app.add_option("--duration", durationSec, "Duration seconds for timed run");
         app.add_flag("--ws-enable", wsEnable, "Enable WebSocket server");
@@ -104,11 +110,16 @@ int main(int argc, char** argv) {
         app.add_option("--perf-out", perfOut, "Write NDJSON perf summaries to file");
         app.add_option("--perf-interval", perfIntervalMs, "Summary interval ms");
         app.set_help_all_flag("--help-all", "Show all help");
+        // WS delta aggregation flags
+        app.add_option("--ws-delta-rate-hz", wsDeltaRateHz, "Delta flush rate Hz (0=immediate)");
+        app.add_option("--ws-delta-max-batch", wsDeltaMaxBatch, "Max keys per delta batch");
+        app.add_option("--ws-delta-epsilon", wsDeltaEpsilon, "Float epsilon to suppress small changes (0=off)");
+        app.add_option("--ws-heartbeat-sec", wsHeartbeatSec, "Idle heartbeat every N seconds (0=off)");
+        app.add_flag("--ws-delta-fast", wsDeltaFast, "Send immediate tiny delta on set");
         app.allow_extras();
         app.parse(argc, argv);
     } catch (const CLI::ParseError &e) {
-        CLI::App dummy;
-        return dummy.exit(e);
+        return app.exit(e);
     }
     if (NODEFLOW_NUM_PORTS > 0) {
         fmt::print("[host] schema: ports={} topo={}\n", NODEFLOW_NUM_PORTS, NODEFLOW_NUM_TOPO);
@@ -217,6 +228,9 @@ int main(int argc, char** argv) {
     std::mutex wsMutex;
     std::mutex hostMutex; // guards in/out/state during WS access
     std::string latestJson;
+    std::unordered_map<std::string, std::string> pendingDelta;
+    auto lastFlush = std::chrono::steady_clock::now();
+    auto lastActivity = std::chrono::steady_clock::now();
     std::function<std::string()> buildSnapshot;
     std::function<std::string()> buildDelta;
     std::string wsRegex; // compiled regex key used in endpoint map
@@ -370,8 +384,34 @@ int main(int argc, char** argv) {
                         nodeflow_step(&in, &out, &state);
                     }
                     try { conn->send("{\"ok\":true}\n"); } catch(...) {}
-                    // Broadcast new snapshot immediately
-                    if (buildSnapshot && wsServer) {
+                    // Immediate fast delta on set
+                    if (wsDeltaFast && wsServer) {
+                        std::string key = getStr(data, "node");
+                        if (key.empty() && has(data, "\"handle\"")) {
+                            int handle = static_cast<int>(getNum(data, "handle"));
+                            if (handle >= 0 && handle < NODEFLOW_NUM_PORTS) key = NODEFLOW_PORTS[handle].nodeId;
+                        }
+                        // Prefer canonical nodeId:portId when possible
+                        if (!key.empty()) {
+                            for (int i = 0; i < NODEFLOW_NUM_PORTS; ++i) {
+                                const auto &p = NODEFLOW_PORTS[i];
+                                if (p.is_output && p.nodeId == key) { key = std::string(p.nodeId) + ":" + p.portId; break; }
+                            }
+                        }
+                        std::string val = fmt::format("{:.3f}", value);
+                        std::string delta = std::string("{\"type\":\"delta\",\"") + key + "\":" + val + "}\n";
+                        auto it = wsServer->endpoint.find(wsRegex);
+                        if (it != wsServer->endpoint.end()) {
+                            for (auto &c : it->second.get_connections()) c->send(delta);
+                        }
+                        // Update lastOutByHandle so the next aggregated buildDelta won't resend the same change
+                        for (int i = 0; i < NODEFLOW_NUM_PORTS; ++i) {
+                            const auto &p = NODEFLOW_PORTS[i];
+                            if (!p.is_output) continue;
+                            if (p.nodeId == key) lastOutByHandle[p.handle] = value;
+                        }
+                        lastActivity = std::chrono::steady_clock::now();
+                    } else if (buildSnapshot && wsServer) {
                         std::string snap = buildSnapshot();
                         {
                             std::lock_guard<std::mutex> lock(wsMutex);
@@ -381,15 +421,7 @@ int main(int argc, char** argv) {
                         if (it != wsServer->endpoint.end()) {
                             for (auto &c : it->second.get_connections()) c->send(snap);
                         }
-                        if (buildDelta) {
-                            std::string delta = buildDelta();
-                            if (!delta.empty()) {
-                                auto it2 = wsServer->endpoint.find(wsRegex);
-                                if (it2 != wsServer->endpoint.end()) {
-                                    for (auto &c : it2->second.get_connections()) c->send(delta);
-                                }
-                            }
-                        }
+                        lastActivity = std::chrono::steady_clock::now();
                     }
                 } else if (type == "subscribe") {
                     try { conn->send("{\"ok\":true}\n"); } catch(...) {}
