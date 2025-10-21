@@ -31,6 +31,7 @@ int main(int argc, char** argv) {
     // Resolve flow file path
     std::string flowPath = "devicetrigger_addition.json";
     bool buildAOT = false;
+    bool buildAOTLLVM = false;
     std::string outDir;
     int wsPort = 9002;
     std::string wsPath = "/stream";
@@ -43,6 +44,7 @@ int main(int argc, char** argv) {
     try {
         app.add_option("--flow", flowPath, "Path to flow JSON file");
         app.add_flag("--build-aot", buildAOT, "Generate AOT step library using flow basename");
+        app.add_flag("--aot-llvm", buildAOTLLVM, "Use LLVM-style backend when generating AOT (experimental)");
         app.add_option("--out-dir", outDir, "Directory to write generated AOT files");
         app.add_option("--ws-port", wsPort, "WebSocket port");
         app.add_option("--ws-path", wsPath, "WebSocket path (e.g., /stream)");
@@ -99,7 +101,7 @@ int main(int argc, char** argv) {
             // Simpler: prepend outDir to base
             base = outDir + "/" + base;
         }
-        engine.generateStepLibrary(base);
+        if (buildAOTLLVM || NODEFLOW_AOT_LLVM) engine.generateStepLibraryLLVM(base); else engine.generateStepLibrary(base);
         // Do not start runtime when building AOT artifacts
         return 0;
     }

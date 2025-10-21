@@ -682,6 +682,215 @@ void FlowEngine::compileToExecutable(const std::string& outputFile, bool /*dslMo
 
 } // namespace NodeFlow
  
+void NodeFlow::FlowEngine::generateStepLibraryLLVM(const std::string& baseName) const {
+    const std::string headerPath = baseName + "_step.h";
+    const std::string descPath = baseName + "_step_desc.cpp"; // descriptors and glue
+    const std::string irPath = baseName + "_step.ll";          // LLVM IR for step/step_n
+    std::ofstream h(headerPath), c(descPath), ll(irPath);
+    if (!h.is_open() || !c.is_open() || !ll.is_open()) return;
+
+    auto getBaseType = [](const std::string& t) {
+        return t.rfind("async_", 0) == 0 ? t.substr(6) : t;
+    };
+    auto toCType = [&](const std::string& t) -> std::string {
+        const auto bt = getBaseType(t);
+        if (bt == "int") return "int";
+        if (bt == "double") return "double";
+        return "float";
+    };
+
+    // Inputs: all DeviceTrigger nodes
+    std::vector<const Node*> inputNodes;
+    for (const auto& n : nodes) if (n.type == "DeviceTrigger" && !n.outputs.empty()) inputNodes.push_back(&n);
+    // Sinks: nodes with no outgoing edges
+    std::vector<const Node*> sinkNodes;
+    for (const auto& n : nodes) {
+        bool hasOut = false;
+        for (const auto& cc : connections) { if (cc.fromNode == n.id) { hasOut = true; break; } }
+        if (!hasOut && !n.outputs.empty()) sinkNodes.push_back(&n);
+    }
+    if (sinkNodes.empty()) for (const auto& n : nodes) if (!n.outputs.empty()) sinkNodes.push_back(&n);
+
+    // Header (ABI-compatible, with step_n addition)
+    h << "#pragma once\n";
+    h << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
+    h << "#include <stddef.h>\n";
+    h << "#if defined(__clang__) || defined(__GNUC__)\n#define NF_RESTRICT __restrict__\n#else\n#define NF_RESTRICT\n#endif\n";
+    h << "typedef struct {\n";
+    for (const auto* n : inputNodes) h << "  " << toCType(n->outputs[0].dataType) << " " << n->id << ";\n";
+    h << "} NodeFlowInputs;\n";
+    h << "typedef struct {\n";
+    for (const auto* n : sinkNodes) h << "  " << toCType(n->outputs[0].dataType) << " " << n->id << ";\n";
+    h << "} NodeFlowOutputs;\n";
+    h << "typedef struct {\n";
+    h << "} NodeFlowState;\n";
+    h << "void nodeflow_step(const NodeFlowInputs* NF_RESTRICT in, NodeFlowOutputs* NF_RESTRICT out, NodeFlowState* NF_RESTRICT state);\n";
+    h << "void nodeflow_step_n(int n, const NodeFlowInputs* NF_RESTRICT in, NodeFlowOutputs* NF_RESTRICT out, NodeFlowState* NF_RESTRICT state);\n";
+    // Descriptors
+    h << "typedef struct { int handle; const char* nodeId; const char* portId; int is_output; const char* dtype; } NodeFlowPortDesc;\n";
+    h << "extern const int NODEFLOW_NUM_PORTS;\n";
+    h << "extern const NodeFlowPortDesc NODEFLOW_PORTS[];\n";
+    h << "extern const int NODEFLOW_NUM_TOPO;\n";
+    h << "extern const int NODEFLOW_TOPO_ORDER[];\n";
+    h << "typedef struct { const char* nodeId; size_t offset; const char* dtype; } NodeFlowInputField;\n";
+    h << "extern const int NODEFLOW_NUM_INPUT_FIELDS;\n";
+    h << "extern const NodeFlowInputField NODEFLOW_INPUT_FIELDS[];\n";
+    // Helper ABI (parity)
+    h << "void nodeflow_init(NodeFlowState* state);\n";
+    h << "void nodeflow_reset(NodeFlowState* state);\n";
+    h << "void nodeflow_set_input(int handle, double value, NodeFlowInputs* in, NodeFlowState* state);\n";
+    h << "double nodeflow_get_output(int handle, const NodeFlowOutputs* out, const NodeFlowState* state);\n";
+    h << "#ifdef __cplusplus\n}\n#endif\n";
+    h.close();
+
+    auto findNodeById = [&](const std::string& id) -> const Node* {
+        for (const auto& n : nodes) if (n.id == id) return &n; return nullptr;
+    };
+
+    // Include header by basename so it works with include_directories
+    std::string headerBase = headerPath;
+    {
+        auto pos = headerBase.find_last_of("/\\");
+        if (pos != std::string::npos) headerBase = headerBase.substr(pos + 1);
+    }
+    c << "#include \"" << headerBase << "\"\n";
+    c << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
+    // Topo
+    c << "const int NODEFLOW_NUM_TOPO = " << executionOrder.size() << ";\n";
+    c << "const int NODEFLOW_TOPO_ORDER[" << executionOrder.size() << "] = {";
+    for (size_t i = 0; i < executionOrder.size(); ++i) c << (i?",":"") << (int)i;
+    c << "};\n";
+    // Ports
+    struct TempPort { int handle; std::string nodeId; std::string portId; bool isOutput; std::string dtype; };
+    std::vector<TempPort> tempPorts;
+    for (const auto &n : nodes) {
+        for (const auto &ip : n.inputs) tempPorts.push_back({getPortHandle(n.id, ip.id, "input"), n.id, ip.id, false, ip.dataType});
+        for (const auto &op : n.outputs) tempPorts.push_back({getPortHandle(n.id, op.id, "output"), n.id, op.id, true, op.dataType});
+    }
+    c << "const int NODEFLOW_NUM_PORTS = " << tempPorts.size() << ";\n";
+    c << "const NodeFlowPortDesc NODEFLOW_PORTS[" << tempPorts.size() << "] = {\n";
+    for (size_t i = 0; i < tempPorts.size(); ++i) {
+        const auto &p = tempPorts[i];
+        c << "  { " << p.handle << ", \"" << p.nodeId << "\", \"" << p.portId << "\", " << (p.isOutput?1:0) << ", \"" << toCType(p.dtype) << "\" }" << (i+1<tempPorts.size()? ",\n":"\n");
+    }
+    c << "};\n\n";
+    // Input fields
+    std::vector<const Node*> inNodes;
+    for (const auto &n : nodes) if (n.type == "DeviceTrigger" && !n.outputs.empty()) inNodes.push_back(&n);
+    c << "const int NODEFLOW_NUM_INPUT_FIELDS = " << inNodes.size() << ";\n";
+    c << "const NodeFlowInputField NODEFLOW_INPUT_FIELDS[" << inNodes.size() << "] = {\n";
+    for (size_t i = 0; i < inNodes.size(); ++i) {
+        const auto *n = inNodes[i];
+        c << "  { \"" << n->id << "\", offsetof(NodeFlowInputs, " << n->id << "), \"" << toCType(n->outputs[0].dataType) << "\" }" << (i+1<inNodes.size()? ",\n":"\n");
+    }
+    c << "};\n\n";
+    // Helpers (IR provides nodeflow_step and nodeflow_step_n)
+    c << "void nodeflow_init(NodeFlowState*) { }\n";
+    c << "void nodeflow_reset(NodeFlowState*) { }\n";
+    c << "void nodeflow_set_input(int handle, double value, NodeFlowInputs* in, NodeFlowState*) {\n";
+    for (const auto *n : inputNodes) {
+        int h = -1; for (const auto &op : n->outputs) { h = getPortHandle(n->id, op.id, "output"); break; }
+        if (h >= 0) c << "  if (handle == " << h << ") in->" << n->id << " = (" << toCType(n->outputs[0].dataType) << ")value;\n";
+    }
+    c << "}\n";
+    c << "double nodeflow_get_output(int handle, const NodeFlowOutputs* out, const NodeFlowState*) {\n";
+    for (const auto *sn : sinkNodes) {
+        int h = -1; for (const auto &op : sn->outputs) { h = getPortHandle(sn->id, op.id, "output"); break; }
+        if (h >= 0) c << "  if (handle == " << h << ") return (double)out->" << sn->id << ";\n";
+    }
+    c << "  return 0.0;\n";
+    c << "}\n\n";
+
+    c << "#ifdef __cplusplus\n}\n#endif\n";
+    c.close();
+
+    // Emit minimal LLVM IR for float-only graphs (DeviceTrigger, Value, Add)
+    // Types
+    ll << "; ModuleID = 'nodeflow_step'\n";
+    ll << "target triple = \"" << "arm64-apple-macos" << "\"\n\n";
+    // Struct types
+    ll << "%struct.NodeFlowInputs = type { ";
+    for (size_t i = 0; i < inputNodes.size(); ++i) ll << (i?", ":"") << "float";
+    if (inputNodes.empty()) ll << "float";
+    ll << " }\n";
+    ll << "%struct.NodeFlowOutputs = type { ";
+    for (size_t i = 0; i < sinkNodes.size(); ++i) ll << (i?", ":"") << "float";
+    if (sinkNodes.empty()) ll << "float";
+    ll << " }\n";
+    ll << "%struct.NodeFlowState = type { }\n\n";
+
+    // Helper to index inputs/outputs order
+    auto indexOfInput = [&](const std::string& id)->int{
+        for (size_t i = 0; i < inputNodes.size(); ++i) if (inputNodes[i]->id == id) return (int)i; return -1;
+    };
+    auto indexOfSink = [&](const std::string& id)->int{
+        for (size_t i = 0; i < sinkNodes.size(); ++i) if (sinkNodes[i]->id == id) return (int)i; return -1;
+    };
+
+    // Declare/define nodeflow_step
+    ll << "define void @nodeflow_step(%struct.NodeFlowInputs* nocapture readonly %in, %struct.NodeFlowOutputs* nocapture %out, %struct.NodeFlowState* nocapture %state) {\n";
+    // Create SSA values per node id
+    std::unordered_map<std::string, std::string> ssa;
+    int tmpId = 0;
+    auto mk = [&](){ return std::string("%t") + std::to_string(++tmpId); };
+    for (const auto& nodeId : executionOrder) {
+        const Node* n = findNodeById(nodeId);
+        if (!n || n->outputs.empty()) continue;
+        if (n->type == "DeviceTrigger") {
+            int idx = indexOfInput(n->id);
+            if (idx < 0) { ssa[n->id] = "0.0"; continue; }
+            std::string p = mk();
+            ll << "  " << p << " = getelementptr inbounds %struct.NodeFlowInputs, %struct.NodeFlowInputs* %in, i32 0, i32 " << idx << "\n";
+            std::string v = mk();
+            ll << "  " << v << " = load float, float* " << p << ", align 4\n";
+            ssa[n->id] = v;
+        } else if (n->type == "Value") {
+            double dv = 0.0; auto it = n->parameters.find("value");
+            if (it != n->parameters.end()) {
+                if (std::holds_alternative<int>(it->second)) dv = (double)std::get<int>(it->second);
+                else if (std::holds_alternative<float>(it->second)) dv = (double)std::get<float>(it->second);
+                else if (std::holds_alternative<double>(it->second)) dv = std::get<double>(it->second);
+            }
+            std::string v = mk();
+            ll << "  " << v << " = fadd float 0.000000e+00, " << (float)dv << "\n";
+            ssa[n->id] = v;
+        } else if (n->type == "Add") {
+            // sum predecessors
+            std::vector<std::string> src;
+            for (const auto& inP : n->inputs) {
+                for (const auto& cc : connections) if (cc.toNode == n->id && cc.toPort == inP.id) { src.push_back(ssa[cc.fromNode]); break; }
+            }
+            if (src.empty()) { std::string v = mk(); ll << "  " << v << " = fadd float 0.000000e+00, 0.000000e+00\n"; ssa[n->id] = v; }
+            else if (src.size() == 1) { ssa[n->id] = src[0]; }
+            else {
+                std::string acc = src[0];
+                for (size_t i = 1; i < src.size(); ++i) {
+                    std::string v = mk();
+                    ll << "  " << v << " = fadd float " << acc << ", " << src[i] << "\n";
+                    acc = v;
+                }
+                ssa[n->id] = acc;
+            }
+        }
+    }
+    // Store sinks
+    for (const auto* sn : sinkNodes) {
+        int idx = indexOfSink(sn->id);
+        if (idx >= 0) {
+            std::string p = mk();
+            ll << "  " << p << " = getelementptr inbounds %struct.NodeFlowOutputs, %struct.NodeFlowOutputs* %out, i32 0, i32 " << idx << "\n";
+            ll << "  store float " << ssa[sn->id] << ", float* " << p << ", align 4\n";
+        }
+    }
+    ll << "  ret void\n";
+    ll << "}\n\n";
+    // step_n: simple loop
+    ll << "define void @nodeflow_step_n(i32 %n, %struct.NodeFlowInputs* nocapture readonly %in, %struct.NodeFlowOutputs* nocapture %out, %struct.NodeFlowState* nocapture %state) {\n";
+    ll << "entry:\n  br label %loop\n\n";
+    ll << "loop:\n  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]\n  call void @nodeflow_step(%struct.NodeFlowInputs* %in, %struct.NodeFlowOutputs* %out, %struct.NodeFlowState* %state)\n  %i1 = add i32 %i, 1\n  %c = icmp slt i32 %i1, %n\n  br i1 %c, label %loop, label %exit\n\nexit:\n  ret void\n}\n";
+    ll.close();
+}
+
 void NodeFlow::FlowEngine::setNodeValue(const std::string& nodeId, float value) {
     auto it = std::find_if(nodes.begin(), nodes.end(), [&](const Node& n){ return n.id == nodeId; });
     if (it == nodes.end()) return;

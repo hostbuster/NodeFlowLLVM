@@ -78,6 +78,9 @@ public:
     // Minimal AOT/demo codegen helpers
     void compileToExecutable(const std::string& outputFile, bool dslMode = true);
     void generateStepLibrary(const std::string& baseName) const;
+    // Experimental: prefer LLVM-style specialized generation (current stub
+    // routes to the C++ generator; kept for CLI/API parity and future swap-in)
+    void generateStepLibraryLLVM(const std::string& baseName) const;
 
     // Control helpers for runtime/IPC
     // Set a node's current value (commonly DeviceTrigger). Propagates downstream.
