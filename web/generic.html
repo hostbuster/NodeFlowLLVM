@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NodeFlow Web UI (Generic)</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 20px; color: #222; }
+    h1 { margin: 0 0 12px; font-size: 20px; }
+    .row { display: flex; gap: 24px; flex-wrap: wrap; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; min-width: 260px; }
+    .kv { display: grid; grid-template-columns: 1fr auto; gap: 8px 16px; align-items: baseline; }
+    .muted { color: #666; font-size: 12px; }
+    code { background: #f6f8fa; padding: 2px 4px; border-radius: 4px; }
+    input[type="text"], input[type="number"] { width: 100%; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; }
+    button { padding: 6px 10px; border: 1px solid #888; background: #fff; border-radius: 4px; cursor: pointer; }
+    button:hover { background: #f3f3f3; }
+    .ok { color: #0a0; }
+    .err { color: #a00; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+    #log { height: 160px; overflow: auto; background: #fafafa; border: 1px solid #eee; padding: 8px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>NodeFlow Stream</h1>
+  <div class="row">
+    <div class="card" style="flex:1; min-width: 340px;">
+      <div><strong>Status:</strong> <span id="status" class="muted">connecting…</span></div>
+      <div class="muted">WS: <code id="ws-url"></code></div>
+      <div id="schema-info" class="muted"></div>
+      <hr/>
+      <div class="kv" id="values"></div>
+    </div>
+    <div class="card" style="width: 320px;">
+      <div><strong>Set by node</strong></div>
+      <div class="muted">Send {"type":"set","node":"name","value":N}</div>
+      <div style="margin-top:8px;">
+        <label>node</label>
+        <input id="set-node" type="text" placeholder="e.g. key1" />
+      </div>
+      <div style="margin-top:8px;">
+        <label>value</label>
+        <input id="set-value" type="number" step="any" placeholder="e.g. 1" />
+      </div>
+      <div style="margin-top:8px;">
+        <button id="btn-set-node">Send</button>
+      </div>
+      <hr/>
+      <div><strong>Set by handle</strong></div>
+      <div class="muted">Send {"type":"set","handle":H,"value":N}</div>
+      <div style="margin-top:8px;">
+        <label>handle</label>
+        <input id="set-handle" type="number" step="1" placeholder="e.g. 0" />
+      </div>
+      <div style="margin-top:8px;">
+        <label>value</label>
+        <input id="set-handle-value" type="number" step="any" placeholder="e.g. 42" />
+      </div>
+      <div style="margin-top:8px;">
+        <button id="btn-set-handle">Send</button>
+      </div>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px;">
+    <div><strong>Log</strong></div>
+    <div id="log" class="mono"></div>
+  </div>
+
+  <script>
+    (function(){
+      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const url = `${wsProto}://localhost:9002/stream`;
+      const statusEl = document.getElementById('status');
+      const wsUrlEl = document.getElementById('ws-url');
+      const valuesEl = document.getElementById('values');
+      const schemaInfoEl = document.getElementById('schema-info');
+      const logEl = document.getElementById('log');
+      const out = new Map();
+      let ports = [];
+      let nodes = [];
+
+      function log(msg, cls) {
+        const ts = new Date().toLocaleTimeString();
+        const div = document.createElement('div');
+        if (cls) div.className = cls;
+        div.textContent = `[${ts}] ${msg}`;
+        logEl.appendChild(div);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function renderValues() {
+        valuesEl.innerHTML = '';
+        const keys = Array.from(out.keys()).sort();
+        for (const k of keys) {
+          const label = document.createElement('div');
+          label.textContent = k;
+          const val = document.createElement('div');
+          val.textContent = String(out.get(k));
+          valuesEl.appendChild(label);
+          valuesEl.appendChild(val);
+        }
+      }
+
+      function applySnapshot(obj) {
+        for (const [k, v] of Object.entries(obj)) {
+          if (k === 'type') continue;
+          out.set(k, v);
+        }
+        renderValues();
+      }
+
+      function applyDelta(obj) {
+        let changed = false;
+        for (const [k, v] of Object.entries(obj)) {
+          if (k === 'type') continue;
+          out.set(k, v);
+          changed = true;
+        }
+        if (changed) renderValues();
+      }
+
+      function describeSchema(s) {
+        if (s.nodes && s.ports) {
+          nodes = s.nodes;
+          ports = s.ports;
+          schemaInfoEl.textContent = `nodes=${nodes.length} ports=${ports.length}`;
+        } else if (s.ports) {
+          ports = s.ports;
+          schemaInfoEl.textContent = `ports=${ports.length}`;
+        } else {
+          schemaInfoEl.textContent = '';
+        }
+      }
+
+      wsUrlEl.textContent = url;
+      const ws = new WebSocket(url);
+      ws.onopen = () => { statusEl.textContent = 'connected'; log('connected', 'ok'); ws.send('{"type":"subscribe"}\n'); };
+      ws.onclose = () => { statusEl.textContent = 'disconnected'; log('disconnected', 'err'); };
+      ws.onerror = () => { log('ws error', 'err'); };
+      ws.onmessage = (ev) => {
+        const lines = String(ev.data).trim().split(/\n+/);
+        for (const line of lines) {
+          if (!line) continue;
+          try {
+            const msg = JSON.parse(line);
+            if (msg.type === 'schema') describeSchema(msg);
+            else if (msg.type === 'snapshot') applySnapshot(msg);
+            else if (msg.type === 'delta') applyDelta(msg);
+            else if (Object.prototype.hasOwnProperty.call(msg, 'ok')) log(`ok=${msg.ok}`, msg.ok ? 'ok' : 'err');
+          } catch (e) {
+            // ignore non-JSON lines
+          }
+        }
+      };
+
+      document.getElementById('btn-set-node').onclick = () => {
+        const node = document.getElementById('set-node').value.trim();
+        const valStr = document.getElementById('set-value').value.trim();
+        if (!node || !valStr) return;
+        const value = Number(valStr);
+        ws.send(JSON.stringify({ type: 'set', node, value }) + '\n');
+      };
+      document.getElementById('btn-set-handle').onclick = () => {
+        const hStr = document.getElementById('set-handle').value.trim();
+        const valStr = document.getElementById('set-handle-value').value.trim();
+        if (!hStr || !valStr) return;
+        const handle = Number(hStr);
+        const value = Number(valStr);
+        ws.send(JSON.stringify({ type: 'set', handle, value }) + '\n');
+      };
+    })();
+  </script>
+</body>
+</html>
+
+
+

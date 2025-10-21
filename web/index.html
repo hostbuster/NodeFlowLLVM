@@ -10,6 +10,8 @@
     .ctrl { display: flex; align-items: center; gap: 12px; }
     .val { font-weight: 700; min-width: 80px; text-align: right; }
     #log { margin-top: 16px; height: 220px; overflow: auto; background: #0f172a; color: #e2e8f0; padding: 8px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .ok { color: #22c55e; }
+    .err { color: #ef4444; }
     .ts { color: #94a3b8; margin-right: 8px; }
   </style>
 </head>
@@ -63,7 +65,7 @@
       const d = new Date();
       return d.toLocaleTimeString([], {hour12:false}) + '.' + String(d.getMilliseconds()).padStart(3,'0');
     }
-    function log(s) {
+    function log(s, cls) {
       const d = document.createElement('div');
       const t = document.createElement('span');
       t.className = 'ts';
@@ -71,6 +73,7 @@
       const m = document.createElement('span');
       m.textContent = ' ' + s;
       d.appendChild(t); d.appendChild(m);
+      if (cls) d.className = cls;
       logEl.appendChild(d);
       logEl.scrollTop = logEl.scrollHeight;
     }
@@ -79,9 +82,9 @@
     function connect() {
       statusEl.textContent = 'connecting…';
       ws = new WebSocket('ws://127.0.0.1:9002/stream');
-      ws.onopen = () => { statusEl.textContent = 'connected'; log('connected'); };
-      ws.onclose = () => { statusEl.textContent = 'disconnected, retrying…'; log('disconnected'); setTimeout(connect, 1000); };
-      ws.onerror = (e) => { log('error'); };
+      ws.onopen = () => { statusEl.textContent = 'connected'; log('connected', 'ok'); };
+      ws.onclose = () => { statusEl.textContent = 'disconnected, retrying…'; log('disconnected', 'err'); setTimeout(connect, 1000); };
+      ws.onerror = () => { log('error', 'err'); };
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
