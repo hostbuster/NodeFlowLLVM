@@ -73,6 +73,8 @@ public:
     void loadFromJson(const nlohmann::json& json);
     // Evaluate the graph once (non-blocking, deterministic)
     void execute();
+    // Advance internal time for time-based nodes (e.g., Timer); dt in milliseconds
+    void tick(double dtMs);
     // Convenience accessor to current node outputs (kept for compatibility)
     std::unordered_map<NodeId, std::vector<Value>> getOutputs() const;
     // Minimal AOT/demo codegen helpers
@@ -141,12 +143,18 @@ private:
     // Deterministic scheduling scaffolding (ready-queue, topo index)
     std::unordered_map<NodeId, std::vector<NodeId>> dependents; // nodeId -> downstream nodes
     std::unordered_map<NodeId, int> topoIndex; // nodeId -> topological order index
+    std::unordered_map<NodeId, size_t> nodeIndex; // nodeId -> index in nodes vector
     std::vector<NodeId> readyQueue;
     std::unordered_map<NodeId, Generation> readyStamp;
     bool coldStart = true;
 
     // Perf counters (mutated inside execute and enqueue)
     PerfStats perf;
+
+    // Per-node state for time-based/edge-detect nodes
+    std::vector<double> timerAccumMs;      // per Timer node accumulator
+    std::vector<int> counterLastTick;      // per Counter node last input (>0 => 1, else 0)
+    std::vector<double> counterValue;      // per Counter node current value (double for uniformity)
 
     void enqueueNode(const NodeId& id);
     void enqueueDependents(const NodeId& id);

@@ -311,8 +311,15 @@ void FlowEngine::computeExecutionOrder() {
 
     // Build topo index and dependents
     topoIndex.clear();
+    nodeIndex.clear();
     dependents = graph;
     for (size_t i = 0; i < executionOrder.size(); ++i) topoIndex[executionOrder[i]] = static_cast<int>(i);
+    for (size_t i = 0; i < nodes.size(); ++i) nodeIndex[nodes[i].id] = i;
+
+    // Resize per-node state for Timer/Counter
+    timerAccumMs.assign(nodes.size(), 0.0);
+    counterLastTick.assign(nodes.size(), 0);
+    counterValue.assign(nodes.size(), 0.0);
 }
 
 // Evaluate the graph once (non-blocking). Seeds previous outputs, performs
@@ -490,6 +497,40 @@ void FlowEngine::execute() {
                 }
             }
             handled = true;
+        } else if (it->type == "Counter") {
+            // Rising-edge counter: increments when input goes 0->1
+            size_t idx = nodeIndex.count(it->id) ? nodeIndex[it->id] : (size_t)-1;
+            int tickNow = 0;
+            if (!it->inputs.empty()) {
+                int hIn = getPortHandle(it->id, it->inputs[0].id, "input");
+                if (hIn >= 0 && (size_t)hIn < portValues.size()) {
+                    const Value &vv = this->portValues[hIn];
+                    double dv = 0.0;
+                    if (std::holds_alternative<double>(vv)) dv = std::get<double>(vv);
+                    else if (std::holds_alternative<float>(vv)) dv = (double)std::get<float>(vv);
+                    else if (std::holds_alternative<int>(vv)) dv = (double)std::get<int>(vv);
+                    tickNow = (dv > 0.5) ? 1 : 0;
+                }
+            }
+            if (idx != (size_t)-1) {
+                if (tickNow == 1 && counterLastTick[idx] == 0) {
+                    counterValue[idx] += 1.0;
+                }
+                counterLastTick[idx] = tickNow;
+                // Write output with current count
+                for (auto &op : it->outputs) {
+                    op.value = counterValue[idx];
+                    int hOut = getPortHandle(it->id, op.id, "output");
+                    if (hOut >= 0 && (size_t)hOut < portValues.size()) {
+                        this->portValues[hOut] = op.value;
+                        if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                        for (int hIn : outToIn[hOut]) {
+                            if (hIn >= 0 && (size_t)hIn < portValues.size()) this->portValues[hIn] = op.value;
+                        }
+                    }
+                }
+            }
+            handled = true;
         } else {
             // Unknown node type: leave outputs unchanged (no-op)
         }
@@ -530,6 +571,57 @@ void FlowEngine::execute() {
     perf.evalTimeNsAccum += ns;
     if (ns < perf.evalTimeNsMin) perf.evalTimeNsMin = ns;
     if (ns > perf.evalTimeNsMax) perf.evalTimeNsMax = ns;
+}
+
+// Advance time-based nodes; emit pulses and enqueue dependents
+void FlowEngine::tick(double dtMs) {
+    if (dtMs <= 0.0) return;
+    // For each Timer node, accumulate and emit a one-tick pulse when interval reached
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        const auto &n = nodes[i];
+        if (n.type != "Timer" || n.outputs.empty()) continue;
+        double interval = 0.0;
+        auto itp = n.parameters.find("interval_ms");
+        if (itp != n.parameters.end()) {
+            if (std::holds_alternative<int>(itp->second)) interval = (double)std::get<int>(itp->second);
+            else if (std::holds_alternative<float>(itp->second)) interval = (double)std::get<float>(itp->second);
+            else if (std::holds_alternative<double>(itp->second)) interval = std::get<double>(itp->second);
+        }
+        if (interval <= 0.0) continue;
+        timerAccumMs[i] += dtMs;
+        if (timerAccumMs[i] >= interval) {
+            timerAccumMs[i] -= interval;
+            // Emit pulse 1.0 for this eval
+            int hOut = getPortHandle(n.id, n.outputs[0].id, "output");
+            if (hOut >= 0 && (size_t)hOut < portValues.size()) {
+                portValues[hOut] = 1.0f;
+                if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                for (int hIn : outToIn[hOut]) {
+                    if (hIn >= 0 && (size_t)hIn < portValues.size()) portValues[hIn] = 1.0f;
+                }
+            }
+            outputChangedStamp[n.id] = evalGeneration;
+            enqueueDependents(n.id);
+        } else {
+            // Hold at 0.0 between pulses; if transitioning 1->0, propagate and enqueue
+            int hOut = getPortHandle(n.id, n.outputs[0].id, "output");
+            if (hOut >= 0 && (size_t)hOut < portValues.size()) {
+                double prev = 0.0;
+                const Value &pv = portValues[hOut];
+                if (std::holds_alternative<double>(pv)) prev = std::get<double>(pv);
+                else if (std::holds_alternative<float>(pv)) prev = (double)std::get<float>(pv);
+                else if (std::holds_alternative<int>(pv)) prev = (double)std::get<int>(pv);
+                portValues[hOut] = 0.0f;
+                if (prev > 0.5) {
+                    if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                    for (int hIn : outToIn[hOut]) {
+                        if (hIn >= 0 && (size_t)hIn < portValues.size()) portValues[hIn] = 0.0f;
+                    }
+                    enqueueDependents(n.id);
+                }
+            }
+        }
+    }
 }
 
 void FlowEngine::enqueueNode(const NodeId& id) {

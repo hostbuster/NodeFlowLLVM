@@ -93,6 +93,7 @@ int main(int argc, char** argv) {
     int benchDuration = 0;        // seconds
     std::string perfOut;          // NDJSON file for perf summaries
     int perfIntervalMs = 1000;    // summary period
+    int wsSnapshotIntervalSec = 0; // 0 = off
 
     CLI::App app{"NodeFlow AOT Host"};
     try {
@@ -116,6 +117,7 @@ int main(int argc, char** argv) {
         app.add_option("--ws-delta-epsilon", wsDeltaEpsilon, "Float epsilon to suppress small changes (0=off)");
         app.add_option("--ws-heartbeat-sec", wsHeartbeatSec, "Idle heartbeat every N seconds (0=off)");
         app.add_flag("--ws-delta-fast", wsDeltaFast, "Send immediate tiny delta on set");
+        app.add_option("--ws-snapshot-interval", wsSnapshotIntervalSec, "Periodic full snapshot interval seconds (0=off)");
         app.allow_extras();
         app.parse(argc, argv);
     } catch (const CLI::ParseError &e) {
@@ -436,7 +438,9 @@ int main(int argc, char** argv) {
             try { conn->send(buildSchema()); } catch(...) {}
             {
                 std::lock_guard<std::mutex> lock(wsMutex);
-                if (!latestJson.empty()) conn->send(latestJson);
+                std::string snap = buildSnapshot();
+                latestJson = snap;
+                conn->send(snap);
             }
             fmt::print("[host] ws client connected\n");
         };
@@ -457,9 +461,14 @@ int main(int argc, char** argv) {
         using namespace std::chrono;
         const auto tick = milliseconds(1000 / rateHz);
         const auto endAt = steady_clock::now() + seconds(durationSec);
+        auto lastTs = steady_clock::now();
         while (steady_clock::now() < endAt) {
             {
                 std::lock_guard<std::mutex> lock(hostMutex);
+                auto nowTs = steady_clock::now();
+                auto dtMs = duration_cast<milliseconds>(nowTs - lastTs).count();
+                lastTs = nowTs;
+                if (dtMs > 0) nodeflow_tick((double)dtMs, &in, &out, &state);
                 nodeflow_step(&in, &out, &state);
             }
             // Print all outputs generically
@@ -497,9 +506,14 @@ int main(int argc, char** argv) {
             // If WS is enabled without a rate/duration, keep serving snapshots until Ctrl+C
             using namespace std::chrono_literals;
             fmt::print("[host] WS enabled - serving snapshots. Press Ctrl+C to exit.\n");
+            auto lastTs = std::chrono::steady_clock::now();
             while (true) {
                 {
                     std::lock_guard<std::mutex> lock(hostMutex);
+                    auto nowTs = std::chrono::steady_clock::now();
+                    auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(nowTs - lastTs).count();
+                    lastTs = nowTs;
+                    if (dtMs > 0) nodeflow_tick((double)dtMs, &in, &out, &state);
                     nodeflow_step(&in, &out, &state);
                 }
                 std::string snap = buildSnapshot();

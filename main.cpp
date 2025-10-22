@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
     double wsDeltaEpsilon = 0.0;   // 0 disables epsilon filtering
     int wsHeartbeatSec = 15;       // 0 disables heartbeat
     bool wsDeltaFast = true;       // send immediate tiny delta on set
+    int wsSnapshotIntervalSec = 0; // 0 = no periodic snapshots (only on connect)
     CLI::App app{"NodeFlowCore"};
     try {
         app.add_option("--flow", flowPath, "Path to flow JSON file");
@@ -66,6 +67,7 @@ int main(int argc, char** argv) {
         app.add_option("--ws-delta-epsilon", wsDeltaEpsilon, "Float epsilon to suppress tiny changes (0=off)");
         app.add_option("--ws-heartbeat-sec", wsHeartbeatSec, "Send heartbeat every N seconds when idle (0=off)");
         app.add_flag("--ws-delta-fast", wsDeltaFast, "Send immediate tiny delta for set operations");
+        app.add_option("--ws-snapshot-interval", wsSnapshotIntervalSec, "Periodic full snapshot interval seconds (0=off)");
         
         app.allow_extras(false);
         app.validate_positionals();
@@ -388,8 +390,11 @@ int main(int argc, char** argv) {
             try {
                 auto schema = buildSchema();
                 conn->send(schema);
+                // Always send a fresh snapshot on connect
+                auto snap = buildSnapshot();
+                latestJson = snap;
+                conn->send(snap);
             } catch(...) {}
-            if (!latestJson.empty()) conn->send(latestJson);
             fmt::print("client connected\n");
         };
         ep.on_close = [&](auto /*conn*/, int /*status*/, const std::string& /*reason*/){ fmt::print("client disconnected\n"); };
@@ -399,7 +404,14 @@ int main(int argc, char** argv) {
 
     // Main loop: Run flow and broadcast generic snapshots and deltas
     NodeFlow::Generation lastSnapshotGen = 0;
+    using Steady = std::chrono::steady_clock;
+    auto lastTs = Steady::now();
+    auto lastFullSnapshot = Steady::now();
     while (running) {
+        auto nowTs = Steady::now();
+        auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(nowTs - lastTs).count();
+        lastTs = nowTs;
+        if (dtMs > 0) engine.tick((double)dtMs);
         engine.execute();
         auto valueToJsonLoop = [](const NodeFlow::Value &v) -> std::string {
             if (std::holds_alternative<float>(v)) return fmt::format("{:.3f}", std::get<float>(v));
@@ -416,33 +428,29 @@ int main(int argc, char** argv) {
             return "null";
         };
 
-        std::string jsonOut = "{\"type\":\"snapshot\"";
-        const auto &portsOut = engine.getPortDescs();
-        std::unordered_map<std::string,int> outCount2;
-        for (const auto &p : portsOut) if (p.direction == "output") ++outCount2[p.nodeId];
-        for (const auto &p : portsOut) {
-            if (p.direction != "output") continue;
-            auto v = engine.readPort(p.handle);
-            jsonOut += ",\""; jsonOut += p.nodeId; jsonOut += ":"; jsonOut += p.portId; jsonOut += "\":";
-            jsonOut += valueToJsonLoop(v);
-            if (outCount2[p.nodeId] == 1) {
-                jsonOut += ",\""; jsonOut += p.nodeId; jsonOut += "\":"; jsonOut += valueToJsonLoop(v);
-            }
-        }
-        jsonOut += "}\n";
-
-        {
-            std::lock_guard<std::mutex> lock(wsMutex);
-            latestJson = jsonOut;
-        }
-        if (wsServer) {
-            auto endpoint_it = wsServer->endpoint.find(wsRegex);
-            if (endpoint_it != wsServer->endpoint.end()) {
-                auto &endpoint = endpoint_it->second;
-                for (auto &conn : endpoint.get_connections()) {
-                    conn->send(jsonOut);
+        // Periodic full snapshot (optional)
+        if (wsServer && wsSnapshotIntervalSec > 0 && std::chrono::duration_cast<std::chrono::seconds>(Steady::now() - lastFullSnapshot).count() >= wsSnapshotIntervalSec) {
+            std::string jsonOut = "{\"type\":\"snapshot\"";
+            const auto &portsOut = engine.getPortDescs();
+            std::unordered_map<std::string,int> outCount2;
+            for (const auto &p : portsOut) if (p.direction == "output") ++outCount2[p.nodeId];
+            for (const auto &p : portsOut) {
+                if (p.direction != "output") continue;
+                auto v = engine.readPort(p.handle);
+                jsonOut += ",\""; jsonOut += p.nodeId; jsonOut += ":"; jsonOut += p.portId; jsonOut += "\":";
+                jsonOut += valueToJsonLoop(v);
+                if (outCount2[p.nodeId] == 1) {
+                    jsonOut += ",\""; jsonOut += p.nodeId; jsonOut += "\":"; jsonOut += valueToJsonLoop(v);
                 }
             }
+            jsonOut += "}\n";
+            {
+                std::lock_guard<std::mutex> lock(wsMutex);
+                latestJson = jsonOut;
+            }
+            auto endpoint_it = wsServer->endpoint.find(wsRegex);
+            if (endpoint_it != wsServer->endpoint.end()) for (auto &conn : endpoint_it->second.get_connections()) conn->send(jsonOut);
+            lastFullSnapshot = Steady::now();
         }
 
         // Delta aggregation using evaluation generation counters (per-port)
@@ -468,6 +476,9 @@ int main(int argc, char** argv) {
                     } catch(...) {}
                 }
                 pendingDelta[key] = v;
+                // For single-output nodes, also upsert plain alias for UI convenience
+                // (metronome1, counter1, add1)
+                pendingDelta[nodeId] = v;
             }
             lastActivity = std::chrono::steady_clock::now();
         }

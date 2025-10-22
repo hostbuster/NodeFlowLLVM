@@ -1,0 +1,59 @@
+{
+  "nodes": [
+    {
+      "id": "key1",
+      "type": "DeviceTrigger",
+      "inputs": [],
+      "outputs": [{"id": "out1", "type": "async_float"}],
+      "parameters": {"key": "1", "value": 1.0}
+    },
+    {
+      "id": "key2",
+      "type": "DeviceTrigger",
+      "inputs": [],
+      "outputs": [{"id": "out1", "type": "async_float"}],
+      "parameters": {"key": "2", "value": 2.0}
+    },
+    {
+      "id": "random1",
+      "type": "DeviceTrigger",
+      "inputs": [],
+      "outputs": [{"id": "out1", "type": "async_float"}],
+      "parameters": {"min_interval": 5000, "max_interval": 10000}
+    },
+    {
+      "id": "metronome1",
+      "type": "Timer",
+      "inputs": [],
+      "outputs": [{"id": "out1", "type": "async_float"}],
+      "parameters": {"interval_ms": 3000}
+    },
+    {
+      "id": "counter1",
+      "type": "Counter",
+      "inputs": [{"id": "in1", "type": "async_float"}],
+      "outputs": [{"id": "out1", "type": "float"}],
+      "parameters": {}
+    },
+    {
+      "id": "add1",
+      "type": "Add",
+      "inputs": [
+        {"id": "in1", "type": "async_float"},
+        {"id": "in2", "type": "async_float"},
+        {"id": "in3", "type": "async_float"},
+        {"id": "in4", "type": "float"}
+      ],
+      "outputs": [{"id": "out1", "type": "float"}]
+    }
+  ],
+  "connections": [
+    {"fromNode": "key1", "fromPort": "out1", "toNode": "add1", "toPort": "in1"},
+    {"fromNode": "key2", "fromPort": "out1", "toNode": "add1", "toPort": "in2"},
+    {"fromNode": "random1", "fromPort": "out1", "toNode": "add1", "toPort": "in3"},
+    {"fromNode": "metronome1", "fromPort": "out1", "toNode": "counter1", "toPort": "in1"},
+    {"fromNode": "counter1", "fromPort": "out1", "toNode": "add1", "toPort": "in4"}
+  ]
+}
+
+
