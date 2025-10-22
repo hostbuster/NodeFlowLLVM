@@ -84,7 +84,7 @@ void Node::execute(std::unordered_map<PortId, Value>& portValues) {
         }
         std::string dataType = outputs[0].dataType;
         auto getBaseType = [](const std::string& t) {
-            return t.find("async_") == 0 ? t.substr(6) : t;
+            return t;
         };
         std::string baseType = getBaseType(inputs[0].dataType);
         for (const auto& input : inputs) {
@@ -238,9 +238,12 @@ void FlowEngine::loadFromJson(const nlohmann::json& json) {
                                      [&](const Port& p) { return p.id == conn.fromPort; });
         auto toPort = std::find_if(toNode->inputs.begin(), toNode->inputs.end(),
                                    [&](const Port& p) { return p.id == conn.toPort; });
-        auto getBaseType = [](const std::string& t) { return t.find("async_") == 0 ? t.substr(6) : t; };
-        if (getBaseType(fromPort->dataType) != getBaseType(toPort->dataType)) {
-            throw std::runtime_error("Type mismatch in connection");
+        auto isNumeric = [](const std::string &t){ return t=="int" || t=="float" || t=="double"; };
+        const std::string &fromT = fromPort->dataType;
+        const std::string &toT = toPort->dataType;
+        // Allow numeric coercion (int/float/double); only reject if one is non-numeric or they differ in kind
+        if (!(isNumeric(fromT) && isNumeric(toT))) {
+            if (fromT != toT) throw std::runtime_error("Type mismatch in connection");
         }
         connections.push_back(conn);
     }
@@ -402,96 +405,64 @@ void FlowEngine::execute() {
         } else if (it->type == "Add") {
             if (!it->outputs.empty()) {
                 const std::string &dtype = it->outputs[0].dataType;
-                auto baseType = [&](const std::string &t){ return t.rfind("async_", 0) == 0 ? t.substr(6) : t; };
+                auto baseType = [&](const std::string &t){ return t; };
                 std::string bt = baseType(dtype);
+                // Sum with compute dtype matching output dtype (cast inputs)
                 if (bt == "int") {
-                    int sum = 0;
-                    std::string dbg = "inputs:";
+                    long long sum = 0;
                     for (const auto &ip : it->inputs) {
-                        int v = 0;
                         int hIn = getPortHandle(it->id, ip.id, "input");
                         if (hIn >= 0 && (size_t)hIn < portValues.size()) {
                             const Value &vv = this->portValues[hIn];
-                            if (std::holds_alternative<int>(vv)) v = std::get<int>(vv);
-                            else if (std::holds_alternative<float>(vv)) v = (int)std::get<float>(vv);
-                            else if (std::holds_alternative<double>(vv)) v = (int)std::get<double>(vv);
+                            if (std::holds_alternative<int>(vv)) sum += std::get<int>(vv);
+                            else if (std::holds_alternative<float>(vv)) sum += (int)std::get<float>(vv);
+                            else if (std::holds_alternative<double>(vv)) sum += (int)std::get<double>(vv);
                         }
-                        sum += v;
-                        dbg += " " + std::to_string(v);
                     }
-                    
                     for (auto &op : it->outputs) {
-                        op.value = sum;
                         int hOut = getPortHandle(it->id, op.id, "output");
                         if (hOut >= 0 && (size_t)hOut < portValues.size()) {
-                            this->portValues[hOut] = sum;
+                            this->portValues[hOut] = (int)sum;
                             if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
-                            for (int hIn : outToIn[hOut]) {
-                                if (hIn >= 0 && (size_t)hIn < portValues.size()) {
-                                    this->portValues[hIn] = sum;
-                                    (void)portDescs;
-                                }
-                            }
+                            for (int hIn : outToIn[hOut]) if (hIn >= 0 && (size_t)hIn < portValues.size()) this->portValues[hIn] = (int)sum;
                         }
                     }
                 } else if (bt == "double") {
                     double sum = 0.0;
-                    std::string dbg = "inputs:";
                     for (const auto &ip : it->inputs) {
-                        double v = 0.0;
                         int hIn = getPortHandle(it->id, ip.id, "input");
                         if (hIn >= 0 && (size_t)hIn < portValues.size()) {
                             const Value &vv = this->portValues[hIn];
-                            if (std::holds_alternative<double>(vv)) v = std::get<double>(vv);
-                            else if (std::holds_alternative<float>(vv)) v = (double)std::get<float>(vv);
-                            else if (std::holds_alternative<int>(vv)) v = (double)std::get<int>(vv);
+                            if (std::holds_alternative<double>(vv)) sum += std::get<double>(vv);
+                            else if (std::holds_alternative<float>(vv)) sum += (double)std::get<float>(vv);
+                            else if (std::holds_alternative<int>(vv)) sum += (double)std::get<int>(vv);
                         }
-                        sum += v;
-                        dbg += " " + std::to_string(v);
                     }
-                    
                     for (auto &op : it->outputs) {
-                        op.value = sum;
                         int hOut = getPortHandle(it->id, op.id, "output");
                         if (hOut >= 0 && (size_t)hOut < portValues.size()) {
                             this->portValues[hOut] = sum;
                             if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
-                            for (int hIn : outToIn[hOut]) {
-                                if (hIn >= 0 && (size_t)hIn < portValues.size()) {
-                                    this->portValues[hIn] = sum;
-                                    (void)portDescs;
-                                }
-                            }
+                            for (int hIn : outToIn[hOut]) if (hIn >= 0 && (size_t)hIn < portValues.size()) this->portValues[hIn] = sum;
                         }
                     }
                 } else { // float/default
                     float sum = 0.0f;
-                    std::string dbg = "inputs:";
                     for (const auto &ip : it->inputs) {
-                        float v = 0.0f;
                         int hIn = getPortHandle(it->id, ip.id, "input");
                         if (hIn >= 0 && (size_t)hIn < portValues.size()) {
                             const Value &vv = this->portValues[hIn];
-                            if (std::holds_alternative<float>(vv)) v = std::get<float>(vv);
-                            else if (std::holds_alternative<double>(vv)) v = (float)std::get<double>(vv);
-                            else if (std::holds_alternative<int>(vv)) v = (float)std::get<int>(vv);
+                            if (std::holds_alternative<float>(vv)) sum += std::get<float>(vv);
+                            else if (std::holds_alternative<double>(vv)) sum += (float)std::get<double>(vv);
+                            else if (std::holds_alternative<int>(vv)) sum += (float)std::get<int>(vv);
                         }
-                        sum += v;
-                        dbg += " " + std::to_string(v);
                     }
-                    
                     for (auto &op : it->outputs) {
-                        op.value = sum;
                         int hOut = getPortHandle(it->id, op.id, "output");
                         if (hOut >= 0 && (size_t)hOut < portValues.size()) {
                             this->portValues[hOut] = sum;
                             if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
-                            for (int hIn : outToIn[hOut]) {
-                                if (hIn >= 0 && (size_t)hIn < portValues.size()) {
-                                    this->portValues[hIn] = sum;
-                                    (void)portDescs;
-                                }
-                            }
+                            for (int hIn : outToIn[hOut]) if (hIn >= 0 && (size_t)hIn < portValues.size()) this->portValues[hIn] = sum;
                         }
                     }
                 }
@@ -519,13 +490,20 @@ void FlowEngine::execute() {
                 counterLastTick[idx] = tickNow;
                 // Write output with current count
                 for (auto &op : it->outputs) {
-                    op.value = counterValue[idx];
+                    const std::string &dtype = op.dataType;
+                    auto baseType = [&](const std::string &t){ return t; };
+                    std::string bt = baseType(dtype);
+                    if (bt == "int") op.value = (int)counterValue[idx];
+                    else if (bt == "double") op.value = (double)counterValue[idx];
+                    else op.value = (float)counterValue[idx];
                     int hOut = getPortHandle(it->id, op.id, "output");
                     if (hOut >= 0 && (size_t)hOut < portValues.size()) {
-                        this->portValues[hOut] = op.value;
+                        if (bt == "int") this->portValues[hOut] = (int)counterValue[idx];
+                        else if (bt == "double") this->portValues[hOut] = (double)counterValue[idx];
+                        else this->portValues[hOut] = (float)counterValue[idx];
                         if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
                         for (int hIn : outToIn[hOut]) {
-                            if (hIn >= 0 && (size_t)hIn < portValues.size()) this->portValues[hIn] = op.value;
+                            if (hIn >= 0 && (size_t)hIn < portValues.size()) this->portValues[hIn] = this->portValues[hOut];
                         }
                     }
                 }
@@ -594,7 +572,13 @@ void FlowEngine::tick(double dtMs) {
             // Emit pulse 1.0 for this eval
             int hOut = getPortHandle(n.id, n.outputs[0].id, "output");
             if (hOut >= 0 && (size_t)hOut < portValues.size()) {
-                portValues[hOut] = 1.0f;
+                // Write pulse in declared output dtype
+                const std::string &dtype = n.outputs[0].dataType;
+                auto baseType = [&](const std::string &t){ return t; };
+                std::string bt = baseType(dtype);
+                if (bt == "int") portValues[hOut] = (int)1;
+                else if (bt == "double") portValues[hOut] = (double)1.0;
+                else portValues[hOut] = (float)1.0f;
                 if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
                 for (int hIn : outToIn[hOut]) {
                     if (hIn >= 0 && (size_t)hIn < portValues.size()) portValues[hIn] = 1.0f;
@@ -611,7 +595,13 @@ void FlowEngine::tick(double dtMs) {
                 if (std::holds_alternative<double>(pv)) prev = std::get<double>(pv);
                 else if (std::holds_alternative<float>(pv)) prev = (double)std::get<float>(pv);
                 else if (std::holds_alternative<int>(pv)) prev = (double)std::get<int>(pv);
-                portValues[hOut] = 0.0f;
+                // Reset to 0 in declared dtype
+                const std::string &dtype = n.outputs[0].dataType;
+                auto baseType = [&](const std::string &t){ return t; };
+                std::string bt = baseType(dtype);
+                if (bt == "int") portValues[hOut] = (int)0;
+                else if (bt == "double") portValues[hOut] = (double)0.0;
+                else portValues[hOut] = (float)0.0f;
                 if (prev > 0.5) {
                     if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
                     for (int hIn : outToIn[hOut]) {
@@ -706,7 +696,7 @@ void FlowEngine::compileToExecutable(const std::string& outputFile, bool /*dslMo
     };
     auto addIt = findNode("add1");
     std::string dtype = (addIt != nodes.end() && !addIt->outputs.empty()) ? addIt->outputs[0].dataType : std::string("float");
-    auto getBaseType = [](const std::string& t){ return t.rfind("async_", 0) == 0 ? t.substr(6) : t; };
+    auto getBaseType = [](const std::string& t){ return t; };
     dtype = getBaseType(dtype);
 
     out << "#include <cstdio>\n";
@@ -781,9 +771,7 @@ void NodeFlow::FlowEngine::generateStepLibraryLLVM(const std::string& baseName) 
     std::ofstream h(headerPath), c(descPath), ll(irPath);
     if (!h.is_open() || !c.is_open() || !ll.is_open()) return;
 
-    auto getBaseType = [](const std::string& t) {
-        return t.rfind("async_", 0) == 0 ? t.substr(6) : t;
-    };
+    auto getBaseType = [](const std::string& t) { return t; };
     auto toCType = [&](const std::string& t) -> std::string {
         const auto bt = getBaseType(t);
         if (bt == "int") return "int";
@@ -1037,7 +1025,7 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
     if (!h.is_open() || !c.is_open()) return;
 
     auto getBaseType = [](const std::string& t) {
-        return t.rfind("async_", 0) == 0 ? t.substr(6) : t;
+        return t;
     };
     auto toCType = [&](const std::string& t) -> std::string {
         const auto bt = getBaseType(t);
@@ -1088,7 +1076,7 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
     for (const auto* n : sinkNodes) h << "  " << toCType(n->outputs[0].dataType) << " " << n->id << ";\n";
     h << "} NodeFlowOutputs;\n";
     h << "typedef struct {\n";
-    for (const auto* n : timerNodes) h << "  double acc_" << n->id << ";\n  float tout_" << n->id << ";\n";
+    for (const auto* n : timerNodes) h << "  double acc_" << n->id << ";\n  " << toCType(n->outputs[0].dataType) << " tout_" << n->id << ";\n";
     for (const auto* n : counterNodes) h << "  int last_" << n->id << ";\n  double cnt_" << n->id << ";\n";
     h << "} NodeFlowState;\n";
     h << "void nodeflow_step(const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* state);\n";
@@ -1210,9 +1198,10 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
             else if (std::holds_alternative<float>(itp->second)) interval = (double)std::get<float>(itp->second);
             else if (std::holds_alternative<double>(itp->second)) interval = std::get<double>(itp->second);
         }
-        c << "  s->tout_" << tn->id << " = 0.0f;\n";
+        // reset pulse to 0 in declared dtype
+        c << "  s->tout_" << tn->id << " = (" << toCType(tn->outputs[0].dataType) << ")0;\n";
         if (interval > 0.0) {
-            c << "  s->acc_" << tn->id << " += dt_ms; if (s->acc_" << tn->id << " >= " << interval << ") { s->acc_" << tn->id << " -= " << interval << "; s->tout_" << tn->id << " = 1.0f; }\n";
+            c << "  s->acc_" << tn->id << " += dt_ms; if (s->acc_" << tn->id << " >= " << interval << ") { s->acc_" << tn->id << " -= " << interval << "; s->tout_" << tn->id << " = (" << toCType(tn->outputs[0].dataType) << ")1; }\n";
         }
     }
     // Counters: rising edge on their first input
@@ -1252,8 +1241,10 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
                 for (const auto& cc : connections) if (cc.toNode == n->id && cc.toPort == inP.id) { src.push_back(std::string("_") + cc.fromNode); break; }
             }
             if (src.empty()) src.push_back("0");
+            // Cast each source to the output dtype before summing
+            std::string ctype = toCType(n->outputs[0].dataType);
             c << "  " << outVar << " = ";
-            for (size_t i = 0; i < src.size(); ++i) { if (i) c << " + "; c << src[i]; }
+            for (size_t i = 0; i < src.size(); ++i) { if (i) c << " + "; c << "(" << ctype << ")" << src[i]; }
             c << ";\n";
         }
     }
