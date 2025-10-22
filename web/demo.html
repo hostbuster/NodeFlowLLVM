@@ -92,6 +92,8 @@
     }
 
     let ws;
+    // dtype lookup built from schema: maps "nodeId:portId" and single-output aliases "nodeId" -> dtype
+    const dtypeByKey = new Map();
     function connect() {
       statusEl.textContent = 'connecting…';
       const url = (location.protocol === 'https:' ? 'wss' : 'ws') + '://127.0.0.1:9002/stream';
@@ -106,6 +108,24 @@
           try {
             const msg = JSON.parse(line);
             if (msg.type === 'schema') {
+              // Build dtype lookup for outputs and single-output node aliases
+              dtypeByKey.clear();
+              const outCount = new Map();
+              if (Array.isArray(msg.ports)) {
+                for (const p of msg.ports) {
+                  if (p && p.direction === 'output') {
+                    outCount.set(p.nodeId, (outCount.get(p.nodeId) || 0) + 1);
+                  }
+                }
+                for (const p of msg.ports) {
+                  if (p && p.direction === 'output') {
+                    dtypeByKey.set(`${p.nodeId}:${p.portId}`, p.dtype);
+                    if (outCount.get(p.nodeId) === 1) {
+                      dtypeByKey.set(p.nodeId, p.dtype);
+                    }
+                  }
+                }
+              }
               log(line);
             } else if (msg.type === 'snapshot') {
               applyKV(msg);
@@ -122,18 +142,30 @@
     connect();
 
     function applyKV(obj) {
-      const v = (k) => (k in obj) ? Number(obj[k]) : undefined;
-      const upd = (id, val) => { if (typeof val === 'number') document.getElementById(id).textContent = val.toFixed(3); };
+      const has = (k) => Object.prototype.hasOwnProperty.call(obj, k);
+      const fmt = (key, num) => {
+        const dtype = dtypeByKey.get(key);
+        if (dtype === 'int') return String(Math.trunc(Number(num)));
+        return Number(num).toFixed(3);
+      };
+      const render = (targetId, primaryKey, fallbackKey) => {
+        let key = undefined;
+        if (has(primaryKey)) key = primaryKey; else if (fallbackKey && has(fallbackKey)) key = fallbackKey;
+        if (!key) return;
+        const val = Number(obj[key]);
+        if (!Number.isFinite(val)) return;
+        document.getElementById(targetId).textContent = fmt(key, val);
+      };
       // key1/key2/rand aliases
-      upd('key1_val', v('key1') ?? v('key1:out1'));
-      upd('key2_val', v('key2') ?? v('key2:out1'));
-      upd('random1_val', v('random1') ?? v('random1:out1'));
+      render('key1_val', 'key1', 'key1:out1');
+      render('key2_val', 'key2', 'key2:out1');
+      render('random1_val', 'random1', 'random1:out1');
       // metronome (pulse 0/1)
-      upd('metronome1_val', v('metronome1') ?? v('metronome1:out1'));
+      render('metronome1_val', 'metronome1', 'metronome1:out1');
       // counter
-      upd('counter1_val', v('counter1') ?? v('counter1:out1'));
+      render('counter1_val', 'counter1', 'counter1:out1');
       // add1 output
-      upd('add1_val', v('add1') ?? v('add1:out1'));
+      render('add1_val', 'add1', 'add1:out1');
     }
 
     function sendJSON(obj) {
