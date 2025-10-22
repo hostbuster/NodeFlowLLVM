@@ -18,6 +18,17 @@
 #include "third_party/Simple-WebSocket-Server/server_ws.hpp"
 #include <mutex>
 
+// Type-aware JSON number formatting for core runtime
+static inline std::string jsonNumberForDtype(const std::string &dtype, double v, int floatPrecision = 3, bool trimZeros = true) {
+    if (dtype == "int") {
+        return fmt::format("{}", static_cast<int>(v));
+    }
+    if (trimZeros) {
+        return fmt::format("{:.{}g}", v, floatPrecision);
+    }
+    return fmt::format("{:.{}f}", v, floatPrecision);
+}
+
 // Global state
 std::atomic<bool> running(true);
 
@@ -229,9 +240,9 @@ int main(int argc, char** argv) {
         };
 
         auto valueToJson = [](const NodeFlow::Value &v) -> std::string {
-            if (std::holds_alternative<float>(v)) return fmt::format("{:.3f}", std::get<float>(v));
-            if (std::holds_alternative<double>(v)) return fmt::format("{:.3f}", std::get<double>(v));
-            if (std::holds_alternative<int>(v)) return fmt::format("{}", std::get<int>(v));
+            if (std::holds_alternative<float>(v)) return jsonNumberForDtype("float", (double)std::get<float>(v), 3);
+            if (std::holds_alternative<double>(v)) return jsonNumberForDtype("double", (double)std::get<double>(v), 3);
+            if (std::holds_alternative<int>(v)) return jsonNumberForDtype("int", (double)std::get<int>(v), 3);
             if (std::holds_alternative<std::string>(v)) {
                 const auto &s = std::get<std::string>(v);
                 std::string esc; esc.reserve(s.size()+2);
@@ -349,8 +360,10 @@ int main(int argc, char** argv) {
                         for (const auto &p2 : ports2b) {
                             if (p2.nodeId == node && p2.direction == "output") { key = node + ":" + p2.portId; break; }
                         }
-                        // Value as formatted JSON number
-                        std::string val = fmt::format("{:.3f}", value);
+                        // Value as formatted JSON number (use node's first output dtype if available)
+                        std::string dtype = "float";
+                        for (const auto &p2b : engine.getPortDescs()) { if (p2b.nodeId == node && p2b.direction == "output") { dtype = p2b.dataType; break; } }
+                        std::string val = jsonNumberForDtype(dtype, (double)value, 3);
                         std::string delta = std::string("{\"type\":\"delta\",\"") + key + "\":" + val + "}\n";
                         auto it_ep = wsServer->endpoint.find(wsRegex);
                         if (it_ep != wsServer->endpoint.end()) {
@@ -414,9 +427,9 @@ int main(int argc, char** argv) {
         if (dtMs > 0) engine.tick((double)dtMs);
         engine.execute();
         auto valueToJsonLoop = [](const NodeFlow::Value &v) -> std::string {
-            if (std::holds_alternative<float>(v)) return fmt::format("{:.3f}", std::get<float>(v));
-            if (std::holds_alternative<double>(v)) return fmt::format("{:.3f}", std::get<double>(v));
-            if (std::holds_alternative<int>(v)) return fmt::format("{}", std::get<int>(v));
+            if (std::holds_alternative<float>(v)) return jsonNumberForDtype("float", (double)std::get<float>(v), 3);
+            if (std::holds_alternative<double>(v)) return jsonNumberForDtype("double", (double)std::get<double>(v), 3);
+            if (std::holds_alternative<int>(v)) return jsonNumberForDtype("int", (double)std::get<int>(v), 3);
             if (std::holds_alternative<std::string>(v)) {
                 const auto &s = std::get<std::string>(v);
                 std::string esc; esc.reserve(s.size()+2);

@@ -32,6 +32,15 @@ extern "C" {
   extern const NodeFlowInputField NODEFLOW_INPUT_FIELDS[];
 }
 
+// Type-aware JSON number formatting: ints as integers, floats/doubles with precision.
+static inline std::string jsonNumberForDtype(const char* dtype, double v, int floatPrecision = 3, bool /*trimZeros*/ = true) {
+    if (dtype && std::strcmp(dtype, "int") == 0) {
+        return fmt::format("{}", static_cast<int>(v));
+    }
+    (void)floatPrecision; // fixed 3 for compatibility
+    return fmt::format("{:.3f}", v);
+}
+
 static float parseFloatArg(int argc, char** argv, const char* name, float defVal) {
     const size_t nlen = std::strlen(name);
     for (int i = 1; i < argc; ++i) {
@@ -286,10 +295,8 @@ int main(int argc, char** argv) {
                     v = nodeflow_get_output(p.handle, &out, &state);
                 }
                 js += ",\""; js += p.nodeId; js += ":"; js += p.portId; js += "\":";
-                js += fmt::format("{:.3f}", v);
-                if (outCount[p.nodeId] == 1) {
-                    js += ",\""; js += p.nodeId; js += "\":"; js += fmt::format("{:.3f}", v);
-                }
+                js += jsonNumberForDtype(p.dtype, v, 3);
+                if (outCount[p.nodeId] == 1) { js += ",\""; js += p.nodeId; js += "\":"; js += jsonNumberForDtype(p.dtype, v, 3); }
             }
             js += "}\n";
             return js;
@@ -320,7 +327,7 @@ int main(int argc, char** argv) {
                     if (isChanged) {
                         if (changed == 0) js = "{\"type\":\"delta\""; // start object lazily
                         js += ",\""; js += p.nodeId; js += ":"; js += p.portId; js += "\":";
-                        js += fmt::format("{:.3f}", v);
+                        js += jsonNumberForDtype(p.dtype, v, 3);
                         ++changed;
                         lastOutByHandle[p.handle] = v;
                     }
@@ -389,28 +396,37 @@ int main(int argc, char** argv) {
                     // Immediate fast delta on set
                     if (wsDeltaFast && wsServer) {
                         std::string key = getStr(data, "node");
+                        const char* dtype = nullptr;
                         if (key.empty() && has(data, "\"handle\"")) {
                             int handle = static_cast<int>(getNum(data, "handle"));
-                            if (handle >= 0 && handle < NODEFLOW_NUM_PORTS) key = NODEFLOW_PORTS[handle].nodeId;
+                            // Find descriptor by handle
+                            for (int i = 0; i < NODEFLOW_NUM_PORTS; ++i) {
+                                const auto &p = NODEFLOW_PORTS[i];
+                                if (p.handle == handle) { key = p.nodeId; if (p.is_output) dtype = p.dtype; break; }
+                            }
                         }
                         // Prefer canonical nodeId:portId when possible
                         if (!key.empty()) {
                             for (int i = 0; i < NODEFLOW_NUM_PORTS; ++i) {
                                 const auto &p = NODEFLOW_PORTS[i];
-                                if (p.is_output && p.nodeId == key) { key = std::string(p.nodeId) + ":" + p.portId; break; }
+                                if (p.is_output && p.nodeId == key) { dtype = p.dtype; key = std::string(p.nodeId) + ":" + p.portId; break; }
                             }
                         }
-                        std::string val = fmt::format("{:.3f}", value);
+                        std::string val = jsonNumberForDtype(dtype, value, 3);
                         std::string delta = std::string("{\"type\":\"delta\",\"") + key + "\":" + val + "}\n";
                         auto it = wsServer->endpoint.find(wsRegex);
                         if (it != wsServer->endpoint.end()) {
                             for (auto &c : it->second.get_connections()) c->send(delta);
                         }
                         // Update lastOutByHandle so the next aggregated buildDelta won't resend the same change
-                        for (int i = 0; i < NODEFLOW_NUM_PORTS; ++i) {
-                            const auto &p = NODEFLOW_PORTS[i];
-                            if (!p.is_output) continue;
-                            if (p.nodeId == key) lastOutByHandle[p.handle] = value;
+                        {
+                            auto pos = key.find(':');
+                            std::string keyNode = (pos == std::string::npos) ? key : key.substr(0, pos);
+                            for (int i = 0; i < NODEFLOW_NUM_PORTS; ++i) {
+                                const auto &p = NODEFLOW_PORTS[i];
+                                if (!p.is_output) continue;
+                                if (p.nodeId == keyNode) lastOutByHandle[p.handle] = value;
+                            }
                         }
                         lastActivity = std::chrono::steady_clock::now();
                     } else if (buildSnapshot && wsServer) {

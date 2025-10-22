@@ -1104,7 +1104,13 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
         for (const auto& n : nodes) if (n.id == id) return &n; return nullptr;
     };
 
-    c << "#include \"" << headerPath << "\"\n";
+    // Include header by basename so relative paths don't double-prefix (e.g., build/build/...)
+    std::string headerBase2 = headerPath;
+    {
+        auto pos = headerBase2.find_last_of("/\\");
+        if (pos != std::string::npos) headerBase2 = headerBase2.substr(pos + 1);
+    }
+    c << "#include \"" << headerBase2 << "\"\n";
     c << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
 
     // Emit topo order as handles of nodes in executionOrder
