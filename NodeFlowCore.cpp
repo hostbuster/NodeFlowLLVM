@@ -1060,6 +1060,23 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
     }
     if (sinkNodes.empty()) for (const auto& n : nodes) if (!n.outputs.empty()) sinkNodes.push_back(&n);
 
+    // Classify nodes for AOT state (timers, counters)
+    std::vector<const Node*> timerNodes;
+    std::vector<const Node*> counterNodes;
+    for (const auto& n : nodes) {
+        if (n.type == "Timer") timerNodes.push_back(&n);
+        else if (n.type == "Counter") counterNodes.push_back(&n);
+    }
+
+    // Build simple source mapping for Counter input0 -> source node id
+    std::unordered_map<std::string,std::string> counterSrc;
+    for (const auto &n : nodes) {
+        if (n.type != "Counter" || n.inputs.empty()) continue;
+        for (const auto &cc : connections) {
+            if (cc.toNode == n.id && cc.toPort == n.inputs[0].id) { counterSrc[n.id] = cc.fromNode; break; }
+        }
+    }
+
     // Header
     h << "#pragma once\n";
     h << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n";
@@ -1071,8 +1088,11 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
     for (const auto* n : sinkNodes) h << "  " << toCType(n->outputs[0].dataType) << " " << n->id << ";\n";
     h << "} NodeFlowOutputs;\n";
     h << "typedef struct {\n";
+    for (const auto* n : timerNodes) h << "  double acc_" << n->id << ";\n  float tout_" << n->id << ";\n";
+    for (const auto* n : counterNodes) h << "  int last_" << n->id << ";\n  double cnt_" << n->id << ";\n";
     h << "} NodeFlowState;\n";
     h << "void nodeflow_step(const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* state);\n";
+    h << "void nodeflow_tick(double dt_ms, const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* state);\n";
 
     // Expose descriptors to host (handles/topo/ports)
     h << "typedef struct { int handle; const char* nodeId; const char* portId; int is_output; const char* dtype; } NodeFlowPortDesc;\n";
@@ -1088,7 +1108,6 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
     h << "void nodeflow_init(NodeFlowState* state);\n";
     h << "void nodeflow_reset(NodeFlowState* state);\n";
     h << "void nodeflow_set_input(int handle, double value, NodeFlowInputs* in, NodeFlowState* state);\n";
-    h << "void nodeflow_tick(double dt_ms, const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* state);\n";
     h << "double nodeflow_get_output(int handle, const NodeFlowOutputs* out, const NodeFlowState* state);\n";
     h << "#ifdef __cplusplus\n}\n#endif\n";
     h.close();
@@ -1141,8 +1160,11 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
     }
     c << "};\n\n";
     // Parity-style helper API definitions
-    c << "void nodeflow_init(NodeFlowState*) { }\n";
-    c << "void nodeflow_reset(NodeFlowState*) { }\n";
+    c << "void nodeflow_init(NodeFlowState* s) {\n";
+    for (const auto* n : timerNodes) c << "  s->acc_" << n->id << " = 0.0; s->tout_" << n->id << " = 0.0f;\n";
+    for (const auto* n : counterNodes) c << "  s->last_" << n->id << " = 0; s->cnt_" << n->id << " = 0.0;\n";
+    c << "}\n";
+    c << "void nodeflow_reset(NodeFlowState* s) { nodeflow_init(s); }\n";
     c << "void nodeflow_set_input(int handle, double value, NodeFlowInputs* in, NodeFlowState*) {\n";
     for (const auto *n : inputNodes) {
         int h = -1; for (const auto &op : n->outputs) { h = getPortHandle(n->id, op.id, "output"); break; }
@@ -1151,18 +1173,56 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
         }
     }
     c << "}\n";
-    c << "double nodeflow_get_output(int handle, const NodeFlowOutputs* out, const NodeFlowState*) {\n";
-    for (const auto *sn : sinkNodes) {
-        int h = -1; for (const auto &op : sn->outputs) { h = getPortHandle(sn->id, op.id, "output"); break; }
-        if (h >= 0) {
-            c << "  if (handle == " << h << ") return (double)out->" << sn->id << ";\n";
+    c << "double nodeflow_get_output(int handle, const NodeFlowOutputs* out, const NodeFlowState* s) {\n";
+    // Expose outputs for all nodes (not only sinks)
+    for (const auto &n : nodes) {
+        if (n.outputs.empty()) continue;
+        int h = getPortHandle(n.id, n.outputs[0].id, "output");
+        if (h < 0) continue;
+        if (n.type == "Timer") {
+            c << "  if (handle == " << h << ") return (double)s->tout_" << n.id << ";\n";
+        } else if (n.type == "Counter") {
+            c << "  if (handle == " << h << ") return s->cnt_" << n.id << ";\n";
+        } else if (n.type == "Value") {
+            double dv = 0.0; auto itv = n.parameters.find("value");
+            if (itv != n.parameters.end()) {
+                if (std::holds_alternative<int>(itv->second)) dv = (double)std::get<int>(itv->second);
+                else if (std::holds_alternative<float>(itv->second)) dv = (double)std::get<float>(itv->second);
+                else if (std::holds_alternative<double>(itv->second)) dv = std::get<double>(itv->second);
+            }
+            c << "  if (handle == " << h << ") return (double)" << dv << ";\n";
+        } else {
+            // For sinks (like add1), return from outputs struct if present
+            bool isSink = true;
+            for (const auto &cc : connections) { if (cc.fromNode == n.id) { isSink = false; break; } }
+            if (isSink) c << "  if (handle == " << h << ") return (double)out->" << n.id << ";\n";
         }
     }
-    c << "  return 0.0;\n";
-    c << "}\n";
-    c << "void nodeflow_tick(double, const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* state) { nodeflow_step(in, out, state); }\n\n";
+    c << "  (void)out; (void)s; return 0.0;\n";
+    c << "}\n\n";
+    // Tick: advance timers and counters
+    c << "void nodeflow_tick(double dt_ms, const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* s) {\n";
+    // Timers
+    for (const auto* tn : timerNodes) {
+        double interval = 0.0; auto itp = tn->parameters.find("interval_ms");
+        if (itp != tn->parameters.end()) {
+            if (std::holds_alternative<int>(itp->second)) interval = (double)std::get<int>(itp->second);
+            else if (std::holds_alternative<float>(itp->second)) interval = (double)std::get<float>(itp->second);
+            else if (std::holds_alternative<double>(itp->second)) interval = std::get<double>(itp->second);
+        }
+        c << "  s->tout_" << tn->id << " = 0.0f;\n";
+        if (interval > 0.0) {
+            c << "  s->acc_" << tn->id << " += dt_ms; if (s->acc_" << tn->id << " >= " << interval << ") { s->acc_" << tn->id << " -= " << interval << "; s->tout_" << tn->id << " = 1.0f; }\n";
+        }
+    }
+    // Counters: rising edge on their first input
+    for (const auto* cn : counterNodes) {
+        std::string src = counterSrc.count(cn->id) ? counterSrc[cn->id] : std::string();
+        if (!src.empty()) c << "  { int tick = (s->tout_" << src << " > 0.5f) ? 1 : 0; if (tick==1 && s->last_" << cn->id << "==0) s->cnt_" << cn->id << "+=1.0; s->last_" << cn->id << " = tick; }\n";
+    }
+    c << "  (void)in; (void)out; }\n\n";
 
-    c << "void nodeflow_step(const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState*) {\n";
+    c << "void nodeflow_step(const NodeFlowInputs* in, NodeFlowOutputs* out, NodeFlowState* s) {\n";
     // Temp vars for node outputs
     for (const auto& n : nodes) if (!n.outputs.empty()) c << "  " << toCType(n.outputs[0].dataType) << " _" << n.id << " = 0;\n";
     c << "\n";
@@ -1173,6 +1233,8 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
         std::string outVar = std::string("_") + n->id;
         if (n->type == "DeviceTrigger") {
             c << "  " << outVar << " = in->" << n->id << ";\n";
+        } else if (n->type == "Timer") {
+            c << "  " << outVar << " = s->tout_" << n->id << ";\n";
         } else if (n->type == "Value") {
             double dv = 0.0;
             auto it = n->parameters.find("value");
@@ -1182,6 +1244,8 @@ void NodeFlow::FlowEngine::generateStepLibrary(const std::string& baseName) cons
                 else if (std::holds_alternative<double>(it->second)) dv = std::get<double>(it->second);
             }
             c << "  " << outVar << " = (" << dv << ");\n";
+        } else if (n->type == "Counter") {
+            c << "  " << outVar << " = (float)s->cnt_" << n->id << ";\n";
         } else if (n->type == "Add") {
             std::vector<std::string> src;
             for (const auto& inP : n->inputs) {
