@@ -58,6 +58,12 @@ int main(int argc, char** argv) {
     int wsHeartbeatSec = 15;       // 0 disables heartbeat
     bool wsDeltaFast = true;       // send immediate tiny delta on set
     int wsSnapshotIntervalSec = 0; // 0 = no periodic snapshots (only on connect)
+    bool wsIncludeTime = false;    // include timing metadata in WS messages
+    // Control/time model
+    bool paused = false;
+    std::string clockType = "wall"; // "wall" | "virtual"
+    double timeScale = 1.0;
+    int fixedRateHz = 0;            // virtual clock fixed step; 0=off
     CLI::App app{"NodeFlowCore"};
     try {
         app.add_option("--flow", flowPath, "Path to flow JSON file");
@@ -80,6 +86,10 @@ int main(int argc, char** argv) {
         app.add_flag("--ws-delta-fast", wsDeltaFast, "Send immediate tiny delta for set operations");
         app.add_option("--ws-snapshot-interval", wsSnapshotIntervalSec, "Periodic full snapshot interval seconds (0=off)");
         
+        app.add_flag("--ws-time", wsIncludeTime, "Include timing metadata in WS messages");
+        app.add_option("--clock", clockType, "Clock type: wall|virtual");
+        app.add_option("--time-scale", timeScale, "Time scale multiplier (0..N)");
+        app.add_option("--ws-fixed-rate", fixedRateHz, "Virtual clock fixed step Hz (0=off)");
         app.allow_extras(false);
         app.validate_positionals();
         app.set_config();
@@ -131,10 +141,6 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Optional demo codegen stub (AOT sample); does nothing in runtime
-#if NODEFLOW_CODEGEN
-    engine.compileToExecutable("nodeflow_output");
-#endif
 
     // No random thread needed; runtime is fully headless
 
@@ -256,7 +262,6 @@ int main(int argc, char** argv) {
 
         auto buildSnapshot = [&]() {
             std::lock_guard<std::mutex> engLock(engineMutex);
-            engine.execute();
             std::string js = "{\"type\":\"snapshot\"";
             const auto &ports = engine.getPortDescs();
             // count outputs per node
@@ -383,6 +388,37 @@ int main(int argc, char** argv) {
                     }
                     conn->send("{\"ok\":true}\n");
                     broadcastSnapshot();
+                } else if (type == "control") {
+                    auto cmd = getStr("cmd");
+                    if (cmd == "pause") { paused = true; conn->send("{\"ok\":true}\n"); }
+                    else if (cmd == "resume") { paused = false; conn->send("{\"ok\":true}\n"); }
+                    else if (cmd == "reset") {
+                        std::lock_guard<std::mutex> engLock(engineMutex);
+                        engine.loadFromJson(json);
+                        conn->send("{\"ok\":true}\n");
+                    }
+                    else if (cmd == "step_eval") {
+                        std::lock_guard<std::mutex> engLock(engineMutex);
+                        engine.execute();
+                        conn->send("{\"ok\":true}\n");
+                    }
+                    else if (cmd == "step_tick") {
+                        double dt = getNum("dt_ms"); if (dt < 0) dt = 0.0;
+                        {
+                            std::lock_guard<std::mutex> engLock(engineMutex);
+                            engine.tick(dt); engine.execute();
+                        }
+                        conn->send("{\"ok\":true}\n");
+                    }
+                    else if (cmd == "set_rate") { int hz = (int)getNum("hz"); fixedRateHz = std::max(0, hz); conn->send("{\"ok\":true}\n"); }
+                    else if (cmd == "set_clock") { auto c = getStr("clock"); if (c=="wall"||c=="virtual") { clockType = c; conn->send("{\"ok\":true}\n"); } else conn->send("{\"ok\":false}\n"); }
+                    else if (cmd == "set_time_scale") { double sc = getNum("scale"); if (sc < 0) sc = 0; timeScale = sc; conn->send("{\"ok\":true}\n"); }
+                    else if (cmd == "status") {
+                        std::string s = std::string("{\"type\":\"status\",\"mode\":\"") + (paused?"paused":"running") + "\",";
+                        s += "\"clock\":\"" + clockType + "\",\"time_scale\":" + fmt::format("{:.3f}", timeScale) + ",\"rate_hz\":" + std::to_string(fixedRateHz) + ",\"eval_gen\":" + std::to_string((long long)engine.currentEvalGeneration()) + "}\n";
+                        conn->send(s);
+                    }
+                    else { conn->send("{\"ok\":false}\n"); }
                 } else if (type == "reload") {
                     auto path = getStr("flow");
                     std::ifstream f(path);
@@ -404,6 +440,11 @@ int main(int argc, char** argv) {
                 auto schema = buildSchema();
                 conn->send(schema);
                 // Always send a fresh snapshot on connect
+                {
+                    std::lock_guard<std::mutex> engLock(engineMutex);
+                    // Ensure at least one execute so initial values/params propagate
+                    engine.execute();
+                }
                 auto snap = buildSnapshot();
                 latestJson = snap;
                 conn->send(snap);
@@ -422,10 +463,15 @@ int main(int argc, char** argv) {
     auto lastFullSnapshot = Steady::now();
     while (running) {
         auto nowTs = Steady::now();
-        auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(nowTs - lastTs).count();
+        double dtMs = (double)std::chrono::duration_cast<std::chrono::milliseconds>(nowTs - lastTs).count();
+        if (clockType == "virtual") {
+            if (fixedRateHz > 0) dtMs = 1000.0 / std::max(1, fixedRateHz);
+            else dtMs = 16.667;
+        }
+        dtMs *= timeScale;
         lastTs = nowTs;
-        if (dtMs > 0) engine.tick((double)dtMs);
-        engine.execute();
+        if (!paused && dtMs > 0.0) engine.tick(dtMs);
+        if (!paused) engine.execute();
         auto valueToJsonLoop = [](const NodeFlow::Value &v) -> std::string {
             if (std::holds_alternative<float>(v)) return jsonNumberForDtype("float", (double)std::get<float>(v), 3);
             if (std::holds_alternative<double>(v)) return jsonNumberForDtype("double", (double)std::get<double>(v), 3);

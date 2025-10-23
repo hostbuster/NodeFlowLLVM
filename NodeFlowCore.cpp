@@ -420,6 +420,7 @@ void FlowEngine::execute() {
                         }
                     }
                     for (auto &op : it->outputs) {
+                        op.value = (int)sum;
                         int hOut = getPortHandle(it->id, op.id, "output");
                         if (hOut >= 0 && (size_t)hOut < portValues.size()) {
                             this->portValues[hOut] = (int)sum;
@@ -439,6 +440,7 @@ void FlowEngine::execute() {
                         }
                     }
                     for (auto &op : it->outputs) {
+                        op.value = (double)sum;
                         int hOut = getPortHandle(it->id, op.id, "output");
                         if (hOut >= 0 && (size_t)hOut < portValues.size()) {
                             this->portValues[hOut] = sum;
@@ -458,6 +460,7 @@ void FlowEngine::execute() {
                         }
                     }
                     for (auto &op : it->outputs) {
+                        op.value = (float)sum;
                         int hOut = getPortHandle(it->id, op.id, "output");
                         if (hOut >= 0 && (size_t)hOut < portValues.size()) {
                             this->portValues[hOut] = sum;
@@ -556,7 +559,7 @@ void FlowEngine::tick(double dtMs) {
     if (dtMs <= 0.0) return;
     // For each Timer node, accumulate and emit a one-tick pulse when interval reached
     for (size_t i = 0; i < nodes.size(); ++i) {
-        const auto &n = nodes[i];
+        auto &n = nodes[i];
         if (n.type != "Timer" || n.outputs.empty()) continue;
         double interval = 0.0;
         auto itp = n.parameters.find("interval_ms");
@@ -576,15 +579,15 @@ void FlowEngine::tick(double dtMs) {
                 const std::string &dtype = n.outputs[0].dataType;
                 auto baseType = [&](const std::string &t){ return t; };
                 std::string bt = baseType(dtype);
-                if (bt == "int") portValues[hOut] = (int)1;
-                else if (bt == "double") portValues[hOut] = (double)1.0;
-                else portValues[hOut] = (float)1.0f;
-                if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                if (bt == "int") { portValues[hOut] = (int)1; n.outputs[0].value = (int)1; }
+                else if (bt == "double") { portValues[hOut] = (double)1.0; n.outputs[0].value = (double)1.0; }
+                else { portValues[hOut] = (float)1.0f; n.outputs[0].value = (float)1.0f; }
+                if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration + 1;
                 for (int hIn : outToIn[hOut]) {
                     if (hIn >= 0 && (size_t)hIn < portValues.size()) portValues[hIn] = 1.0f;
                 }
             }
-            outputChangedStamp[n.id] = evalGeneration;
+            outputChangedStamp[n.id] = evalGeneration + 1;
             enqueueDependents(n.id);
         } else {
             // Hold at 0.0 between pulses; if transitioning 1->0, propagate and enqueue
@@ -599,11 +602,11 @@ void FlowEngine::tick(double dtMs) {
                 const std::string &dtype = n.outputs[0].dataType;
                 auto baseType = [&](const std::string &t){ return t; };
                 std::string bt = baseType(dtype);
-                if (bt == "int") portValues[hOut] = (int)0;
-                else if (bt == "double") portValues[hOut] = (double)0.0;
-                else portValues[hOut] = (float)0.0f;
+                if (bt == "int") { portValues[hOut] = (int)0; n.outputs[0].value = (int)0; }
+                else if (bt == "double") { portValues[hOut] = (double)0.0; n.outputs[0].value = (double)0.0; }
+                else { portValues[hOut] = (float)0.0f; n.outputs[0].value = (float)0.0f; }
                 if (prev > 0.5) {
-                    if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration;
+                    if ((size_t)hOut < portChangedStamp.size()) portChangedStamp[hOut] = evalGeneration + 1;
                     for (int hIn : outToIn[hOut]) {
                         if (hIn >= 0 && (size_t)hIn < portValues.size()) portValues[hIn] = 0.0f;
                     }

@@ -2,9 +2,16 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>NodeFlow Demo (Timer + Counter)</title>
+  <title>NodeFlow Demo</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:10px 12px; border:1px solid #e5e7eb; border-radius:8px; background:#f8fafc; margin-bottom:12px; }
+    .brand { font-weight:800; letter-spacing:0.5px; }
+    .actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .actions button { padding:6px 10px; border:1px solid #d1d5db; background:#ffffff; border-radius:6px; cursor:pointer; }
+    .actions button:hover { background:#f1f5f9; }
+    .actions select, .actions input { padding:4px 6px; border:1px solid #d1d5db; border-radius:6px; background:#fff; }
+    .status { margin-left:8px; color:#334155; font-weight:600; }
     h2 { margin: 0 0 12px; }
     .row { display: grid; grid-template-columns: 360px 200px; gap: 16px; align-items: center; margin: 8px 0; }
     .ctrl { display: flex; align-items: center; gap: 12px; }
@@ -14,11 +21,26 @@
     .ts { color: #94a3b8; margin-right: 8px; }
     .ok { color: #22c55e; }
     .err { color: #ef4444; }
+    .tx { color: #f59e0b; }
   </style>
 </head>
 <body>
-  <h2>NodeFlow Demo</h2>
-  <div id="status">connecting…</div>
+  <div class="topbar">
+    <div class="brand">NodeFlow</div>
+    <div class="actions">
+      <button id="btn_pause">Pause</button>
+      <button id="btn_resume">Resume</button>
+      <button id="btn_step">Step</button>
+      <button id="btn_reset">Reset</button>
+      <select id="sel_clock">
+        <option value="wall">Wall</option>
+        <option value="virtual">Virtual</option>
+      </select>
+      <label>Rate Hz <input id="inp_rate" type="number" value="60" min="0" style="width:68px;"></label>
+      <label>Scale <input id="inp_scale" type="number" value="1" min="0" step="0.1" style="width:60px;"></label>
+      <span id="status" class="status">connecting…</span>
+    </div>
+  </div>
 
   <div class="row">
     <div class="ctrl">
@@ -94,6 +116,7 @@
     let ws;
     // dtype lookup built from schema: maps "nodeId:portId" and single-output aliases "nodeId" -> dtype
     const dtypeByKey = new Map();
+    let nextTxId = 1;
     function connect() {
       statusEl.textContent = 'connecting…';
       const url = (location.protocol === 'https:' ? 'wss' : 'ws') + '://127.0.0.1:9002/stream';
@@ -169,20 +192,43 @@
     }
 
     function sendJSON(obj) {
+      if (!obj || typeof obj !== 'object') return;
+      // assign tx_id if missing
+      if (obj.tx_id === undefined) obj.tx_id = String(Date.now()) + '-' + String(nextTxId++);
+      // derive short summary for TX log
+      let summary = 'TX[' + (obj.type || 'unknown') + ']';
+      if (obj.type === 'control') {
+        summary += ' ' + (obj.cmd || '');
+        if (obj.cmd === 'step_tick' && typeof obj.dt_ms === 'number') summary += ` dt=${obj.dt_ms}`;
+        if (obj.cmd === 'set_rate' && typeof obj.hz === 'number') summary += ` hz=${obj.hz}`;
+        if (obj.cmd === 'set_clock' && obj.clock) summary += ` clock=${obj.clock}`;
+        if (obj.cmd === 'set_time_scale' && typeof obj.scale === 'number') summary += ` scale=${obj.scale}`;
+      } else if (obj.type === 'set') {
+        if (obj.node !== undefined && obj.value !== undefined) summary += ` ${obj.node}=${obj.value}`;
+        else if (obj.handle !== undefined && obj.value !== undefined) summary += ` handle#${obj.handle}=${obj.value}`;
+      }
+      log(summary, 'tx');
       if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj) + '\n');
       else log('ws not ready','err');
     }
 
-    // Controls → core
+    // Toolbar controls → core control messages
+    document.getElementById('btn_pause').addEventListener('click', () => sendJSON({ type: 'control', cmd: 'pause' }));
+    document.getElementById('btn_resume').addEventListener('click', () => sendJSON({ type: 'control', cmd: 'resume' }));
+    document.getElementById('btn_reset').addEventListener('click', () => sendJSON({ type: 'control', cmd: 'reset' }));
+    document.getElementById('btn_step').addEventListener('click', () => sendJSON({ type: 'control', cmd: 'step_tick', dt_ms: 16.667 }));
+    document.getElementById('sel_clock').addEventListener('change', () => sendJSON({ type: 'control', cmd: 'set_clock', clock: document.getElementById('sel_clock').value }));
+    document.getElementById('inp_rate').addEventListener('change', () => sendJSON({ type: 'control', cmd: 'set_rate', hz: Number(document.getElementById('inp_rate').value) }));
+    document.getElementById('inp_scale').addEventListener('change', () => sendJSON({ type: 'control', cmd: 'set_time_scale', scale: Number(document.getElementById('inp_scale').value) }));
+
+    // Demo controls → core
     el.key1_cb.addEventListener('change', () => {
       const value = el.key1_cb.checked ? 1.0 : 0.0;
       sendJSON({ type: 'set', node: 'key1', value });
-      log(`set key1=${value}`);
     });
     el.key2_cb.addEventListener('change', () => {
       const value = el.key2_cb.checked ? 2.0 : 0.0;
       sendJSON({ type: 'set', node: 'key2', value });
-      log(`set key2=${value}`);
     });
     el.random1_slider.addEventListener('input', () => {
       el.random1_send.textContent = el.random1_slider.value;
@@ -190,7 +236,6 @@
     el.random1_slider.addEventListener('change', () => {
       const value = Number(el.random1_slider.value);
       sendJSON({ type: 'set', node: 'random1', value });
-      log(`set random1=${value}`);
     });
   </script>
 </body>

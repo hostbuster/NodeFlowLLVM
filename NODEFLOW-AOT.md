@@ -22,6 +22,7 @@
     - `nodeflow_init(NodeFlowInputs*, NodeFlowOutputs*, NodeFlowState*)`
     - `nodeflow_reset(NodeFlowInputs*, NodeFlowOutputs*, NodeFlowState*)`
     - `nodeflow_set_input(int handle, double value, NodeFlowInputs*, NodeFlowState*)`
+    - `nodeflow_tick(double dt_ms, const NodeFlowInputs*, NodeFlowOutputs*, NodeFlowState*)`  ← advances time
     - `nodeflow_step(const NodeFlowInputs*, NodeFlowOutputs*, NodeFlowState*)`
     - `double nodeflow_get_output(int handle, const NodeFlowOutputs*, const NodeFlowState*)`
 - **Host example** (`aot_host_template.cpp`):
@@ -33,6 +34,18 @@
   - Thread-safe broadcasting and snapshot generation; persistent endpoint regex key.
 - **Runtime parity**:
   - Runtime also emits `schema`, `snapshot`, `delta` via WS, and now includes a compute-only benchmark mode for apples-to-apples comparisons.
+  - Time support in runtime: `FlowEngine::tick(double dtMs)` mirrors AOT `nodeflow_tick` and is called each loop with the real elapsed milliseconds.
+
+### Time and Scheduling (Timers/Counters)
+- `nodeflow_tick(dt_ms, in, out, state)` advances time-based nodes using the elapsed time in milliseconds since the previous call.
+  - Timer nodes accumulate `dt_ms` and emit a one-tick pulse (value 1 in their declared dtype) when their `interval_ms` is reached; otherwise 0.
+  - Counter nodes increment on rising edges of their configured input (pulse 0→1), maintaining count in state.
+- Typical loop order in host/runtime:
+  1) compute `dt_ms` since last iteration
+  2) call `nodeflow_tick(dt_ms, ...)`
+  3) call `nodeflow_step(in, out, state)` to evaluate the graph
+- Pulses are transient per tick: they reset to 0 on the next `nodeflow_tick` unless re-emitted by the timer.
+- The runtime uses the same pattern: `engine.tick(dtMs); engine.execute();`
 
 ### How-To (Generate, Build, Run)
 - **Prerequisites (macOS/Homebrew)**:
@@ -65,6 +78,7 @@ This produces `<base>_step.h/.cpp` (e.g., `devicetrigger_addition_step.*`). CMak
 # Set inputs on the command line
 ./build/devicetrigger_addition_host --set key1=1 --set key2=2 --set random1=42
 ```
+- The host drives time by computing `dt_ms` each iteration and calling `nodeflow_tick(dt_ms, ...)` before `nodeflow_step(...)`. The runtime (`NodeFlowCore`) does the same via `FlowEngine::tick(dtMs)` followed by `execute()`.
 
 - **Web UI**:
   - `web/index.html`: original controls (checkboxes/slider), improved colored log.
