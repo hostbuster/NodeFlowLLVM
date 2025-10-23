@@ -273,10 +273,6 @@ int main(int argc, char** argv) {
                 // canonical key
                 js += ",\""; js += p.nodeId; js += ":"; js += p.portId; js += "\":";
                 js += valueToJson(val);
-                // alias for single-output nodes to keep existing UI working (nodeId only)
-                if (outCount[p.nodeId] == 1) {
-                    js += ",\""; js += p.nodeId; js += "\":"; js += valueToJson(val);
-                }
             }
             js += "}\n";
             return js;
@@ -498,9 +494,6 @@ int main(int argc, char** argv) {
                 auto v = engine.readPort(p.handle);
                 jsonOut += ",\""; jsonOut += p.nodeId; jsonOut += ":"; jsonOut += p.portId; jsonOut += "\":";
                 jsonOut += valueToJsonLoop(v);
-                if (outCount2[p.nodeId] == 1) {
-                    jsonOut += ",\""; jsonOut += p.nodeId; jsonOut += "\":"; jsonOut += valueToJsonLoop(v);
-                }
             }
             jsonOut += "}\n";
             {
@@ -535,9 +528,6 @@ int main(int argc, char** argv) {
                     } catch(...) {}
                 }
                 pendingDelta[key] = v;
-                // For single-output nodes, also upsert plain alias for UI convenience
-                // (metronome1, counter1, add1)
-                pendingDelta[nodeId] = v;
             }
             lastActivity = std::chrono::steady_clock::now();
         }

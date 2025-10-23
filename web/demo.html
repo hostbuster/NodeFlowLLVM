@@ -179,16 +179,13 @@
         if (!Number.isFinite(val)) return;
         document.getElementById(targetId).textContent = fmt(key, val);
       };
-      // key1/key2/rand aliases
-      render('key1_val', 'key1', 'key1:out1');
-      render('key2_val', 'key2', 'key2:out1');
-      render('random1_val', 'random1', 'random1:out1');
-      // metronome (pulse 0/1)
-      render('metronome1_val', 'metronome1', 'metronome1:out1');
-      // counter
-      render('counter1_val', 'counter1', 'counter1:out1');
-      // add1 output
-      render('add1_val', 'add1', 'add1:out1');
+      // Use canonical nodeId:portId keys only (no alias)
+      render('key1_val', 'key1:out1');
+      render('key2_val', 'key2:out1');
+      render('random1_val', 'random1:out1');
+      render('metronome1_val', 'metronome1:out1');
+      render('counter1_val', 'counter1:out1');
+      render('add1_val', 'add1:out1');
     }
 
     function sendJSON(obj) {
