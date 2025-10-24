@@ -70,6 +70,7 @@ make -j
 - WebSocket options
   - `--ws-port <int>` (default 9002)
   - `--ws-path <string>` (default `/stream`)
+  - `--ws-time` include timing metadata envelope `t{wall_ms, mono_ns, dt_ms, clock, time_scale, rate_hz, seq}`
 - Benchmark & perf
   - `--bench`: compute-only mode (no WS); feeds inputs in-process.
   - `--bench-rate <hz>`, `--bench-duration <sec>`
@@ -80,6 +81,10 @@ make -j
   - `--ws-delta-epsilon <float>`: drop tiny float diffs (default 0)
   - `--ws-heartbeat-sec <sec>`: idle heartbeat (default 15)
   - `--ws-delta-fast`: send an immediate tiny delta on set (default on)
+ - Control/time model
+  - `--clock wall|virtual` select wall clock or virtual fixed-step
+  - `--time-scale <float>` scale time (0 = stop; >1 speed up)
+  - `--ws-fixed-rate <hz>` virtual fixed-step rate when `--clock virtual` (default ~60 Hz)
 
 Example:
 ```bash
@@ -125,15 +130,23 @@ cmake -S . -B build -DNODEFLOW_BUILD_RUNTIME=OFF && cmake --build build
 ```
 
 - Messages are NDJSON (one JSON per line):
-  - `{"type":"schema","ports":[{handle,nodeId,portId,direction,dtype},...]}`
-  - `{"type":"snapshot", "node:port": value, ...}` plus plain `"node"` alias for single-output nodes
-  - `{"type":"delta", "node:port": value, ...}` compact changes since last eval (coalesced)
+  - `{"type":"schema", ...}` with `ports` and optional timing envelope `t{...}` when `--ws-time` is set
+  - `{"type":"snapshot", "node:port": value, ...}` (canonical keys only; no alias)
+  - `{"type":"delta", "node:port": value, ...}` compact changes since last eval (coalesced; canonical keys only)
   - `{"ok":true}` small ACKs to control commands
   - `{"type":"heartbeat"}` idle keepalive
 - Client → server controls:
-  - `{"type":"set","node":"key1","value":1.0}` or `{"type":"set","handle":0,"value":1.0}`
-  - `{"type":"subscribe"}` (optional)
-  - `{"type":"config","node":"random1","min_interval":100,"max_interval":300}`
+  - Set inputs: `{"type":"set","node":"key1","value":1.0}` or by handle `{"type":"set","handle":0,"value":1.0}`
+  - Subscribe: `{"type":"subscribe"}` (optional)
+  - Config (demo): `{"type":"config","node":"random1","min_interval":100,"max_interval":300}`
+  - Control/time: `{"type":"control","cmd":"pause|resume|reset|step_eval|step_tick|set_rate|set_clock|set_time_scale|status", ...}`
+    - Examples:
+      - `{"type":"control","cmd":"pause"}`
+      - `{"type":"control","cmd":"step_tick","dt_ms":16.667}`
+      - `{"type":"control","cmd":"set_clock","clock":"virtual"}`
+      - `{"type":"control","cmd":"set_rate","hz":60}`
+      - `{"type":"control","cmd":"set_time_scale","scale":0.5}`
+      - `{"type":"control","cmd":"status"}` → `{"type":"status","mode":"running|paused","clock":"wall|virtual","time_scale":1.0,"rate_hz":60}` (+ `t{...}` when enabled)
 
 ### Build options
 
