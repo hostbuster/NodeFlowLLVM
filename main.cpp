@@ -208,6 +208,28 @@ int main(int argc, char** argv) {
     auto lastFlush = std::chrono::steady_clock::now();
     auto lastActivity = std::chrono::steady_clock::now();
     std::string wsRegex; // compiled endpoint regex key for lookups
+    // Timing metadata helpers available across WS handlers and main loop
+    using SteadyClock = std::chrono::steady_clock;
+    using SystemClock = std::chrono::system_clock;
+    auto processStartSteady = SteadyClock::now();
+    unsigned long long msgSeq = 0;
+    double lastDtMsObserved = 0.0;
+    auto buildT = [&]() {
+        if (!wsIncludeTime) return std::string();
+        auto nowSteady = SteadyClock::now();
+        auto nowSys = SystemClock::now();
+        auto wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(nowSys.time_since_epoch()).count();
+        auto monoNs = std::chrono::duration_cast<std::chrono::nanoseconds>(nowSteady - processStartSteady).count();
+        ++msgSeq;
+        std::string t = ",\"t\":{\"wall_ms\":" + std::to_string((long long)wallMs)
+                        + ",\"mono_ns\":" + std::to_string((long long)monoNs)
+                        + ",\"dt_ms\":" + fmt::format("{:.3f}", lastDtMsObserved)
+                        + ",\"clock\":\"" + clockType + "\""
+                        + ",\"time_scale\":" + fmt::format("{:.3f}", timeScale)
+                        + ",\"rate_hz\":" + std::to_string(fixedRateHz)
+                        + ",\"seq\":" + std::to_string((long long)msgSeq) + "}";
+        return t;
+    };
     {
         wsServer = std::make_unique<WsServer>();
         wsServer->config.port = wsPort;
@@ -223,7 +245,9 @@ int main(int argc, char** argv) {
             const auto &nodes = engine.getNodeDescs();
             const auto &ports = engine.getPortDescs();
             std::string s;
-            s += "{\"type\":\"schema\",";
+            s += "{\"type\":\"schema\"";
+            s += buildT();
+            s += ",";
             s += "\"nodes\":[";
             for (size_t i = 0; i < nodes.size(); ++i) {
                 const auto &n = nodes[i];
@@ -263,6 +287,7 @@ int main(int argc, char** argv) {
         auto buildSnapshot = [&]() {
             std::lock_guard<std::mutex> engLock(engineMutex);
             std::string js = "{\"type\":\"snapshot\"";
+            js += buildT();
             const auto &ports = engine.getPortDescs();
             // count outputs per node
             std::unordered_map<std::string,int> outCount;
@@ -365,7 +390,9 @@ int main(int argc, char** argv) {
                         std::string dtype = "float";
                         for (const auto &p2b : engine.getPortDescs()) { if (p2b.nodeId == node && p2b.direction == "output") { dtype = p2b.dataType; break; } }
                         std::string val = jsonNumberForDtype(dtype, (double)value, 3);
-                        std::string delta = std::string("{\"type\":\"delta\",\"") + key + "\":" + val + "}\n";
+                std::string delta = std::string("{\"type\":\"delta\"");
+                delta += buildT();
+                delta += ",\"" + key + "\":" + val + "}\n";
                         auto it_ep = wsServer->endpoint.find(wsRegex);
                         if (it_ep != wsServer->endpoint.end()) {
                             for (auto &c2 : it_ep->second.get_connections()) c2->send(delta);
@@ -466,6 +493,10 @@ int main(int argc, char** argv) {
         }
         dtMs *= timeScale;
         lastTs = nowTs;
+        // Track dt for timing envelope
+        // Note: buildT captures this by value when composing messages
+        (void)lastDtMsObserved; // keep var used when --ws-time enabled
+        lastDtMsObserved = dtMs;
         if (!paused && dtMs > 0.0) engine.tick(dtMs);
         if (!paused) engine.execute();
         auto valueToJsonLoop = [](const NodeFlow::Value &v) -> std::string {
@@ -486,6 +517,7 @@ int main(int argc, char** argv) {
         // Periodic full snapshot (optional)
         if (wsServer && wsSnapshotIntervalSec > 0 && std::chrono::duration_cast<std::chrono::seconds>(Steady::now() - lastFullSnapshot).count() >= wsSnapshotIntervalSec) {
             std::string jsonOut = "{\"type\":\"snapshot\"";
+            jsonOut += buildT();
             const auto &portsOut = engine.getPortDescs();
             std::unordered_map<std::string,int> outCount2;
             for (const auto &p : portsOut) if (p.direction == "output") ++outCount2[p.nodeId];
@@ -540,6 +572,7 @@ int main(int argc, char** argv) {
         if (wsServer && timeToFlush && !pendingDelta.empty()) {
             int count = 0;
             std::string delta = "{\"type\":\"delta\"";
+            delta += buildT();
             for (const auto &kv : pendingDelta) {
                 if (count >= wsDeltaMaxBatch) break;
                 delta += ",\"" + kv.first + "\":" + kv.second;

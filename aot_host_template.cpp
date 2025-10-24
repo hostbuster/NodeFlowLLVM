@@ -103,6 +103,12 @@ int main(int argc, char** argv) {
     std::string perfOut;          // NDJSON file for perf summaries
     int perfIntervalMs = 1000;    // summary period
     int wsSnapshotIntervalSec = 0; // 0 = off
+    bool wsIncludeTime = false;    // include timing metadata
+    // Control/time model
+    bool paused = false;
+    std::string clockType = "wall"; // wall|virtual
+    double timeScale = 1.0;
+    int fixedRateHz = 0;           // virtual fixed-step Hz (0=off)
 
     CLI::App app{"NodeFlow AOT Host"};
     try {
@@ -127,6 +133,11 @@ int main(int argc, char** argv) {
         app.add_option("--ws-heartbeat-sec", wsHeartbeatSec, "Idle heartbeat every N seconds (0=off)");
         app.add_flag("--ws-delta-fast", wsDeltaFast, "Send immediate tiny delta on set");
         app.add_option("--ws-snapshot-interval", wsSnapshotIntervalSec, "Periodic full snapshot interval seconds (0=off)");
+        // Time/clock options
+        app.add_flag("--ws-time", wsIncludeTime, "Include timing metadata in WS messages");
+        app.add_option("--clock", clockType, "Clock type: wall|virtual");
+        app.add_option("--time-scale", timeScale, "Time scale multiplier (0..N)");
+        app.add_option("--ws-fixed-rate", fixedRateHz, "Virtual clock fixed step Hz (0=off)");
         app.allow_extras();
         app.parse(argc, argv);
     } catch (const CLI::ParseError &e) {
@@ -249,6 +260,28 @@ int main(int argc, char** argv) {
     std::unordered_map<std::string, std::pair<size_t,const char*>> inputLookup;
     // Track last-sent output values for delta emission
     std::unordered_map<int,double> lastOutByHandle;
+    // Timing metadata
+    using Steady = std::chrono::steady_clock;
+    using Sys = std::chrono::system_clock;
+    auto processStartSteady = Steady::now();
+    unsigned long long msgSeq = 0;
+    double lastDtMsObserved = 0.0;
+    auto buildT = [&](){
+        if (!wsIncludeTime) return std::string();
+        auto nowSteady = Steady::now();
+        auto nowSys = Sys::now();
+        auto wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(nowSys.time_since_epoch()).count();
+        auto monoNs = std::chrono::duration_cast<std::chrono::nanoseconds>(nowSteady - processStartSteady).count();
+        ++msgSeq;
+        std::string t = ",\"t\":{\"wall_ms\":" + std::to_string((long long)wallMs)
+                        + ",\"mono_ns\":" + std::to_string((long long)monoNs)
+                        + ",\"dt_ms\":" + fmt::format("{:.3f}", lastDtMsObserved)
+                        + ",\"clock\":\"" + clockType + "\""
+                        + ",\"time_scale\":" + fmt::format("{:.3f}", timeScale)
+                        + ",\"rate_hz\":" + std::to_string(fixedRateHz)
+                        + ",\"seq\":" + std::to_string((long long)msgSeq) + "}";
+        return t;
+    };
     if (wsEnable) {
         wsServer = std::make_unique<WsServer>();
         wsServer->config.port = wsPort;
@@ -261,7 +294,9 @@ int main(int argc, char** argv) {
             inputLookup[NODEFLOW_INPUT_FIELDS[i].nodeId] = {NODEFLOW_INPUT_FIELDS[i].offset, NODEFLOW_INPUT_FIELDS[i].dtype};
         }
         auto buildSchema = [&](){
-            std::string s = "{\"type\":\"schema\",\"ports\":[";
+            std::string s = "{\"type\":\"schema\"";
+            s += buildT();
+            s += ",\"ports\":[";
             for (int i = 0; i < NODEFLOW_NUM_PORTS; ++i) {
                 if (i) s += ",";
                 const auto &p = NODEFLOW_PORTS[i];
@@ -278,6 +313,7 @@ int main(int argc, char** argv) {
                 if (p.is_output) ++outCount[p.nodeId];
             }
             std::string js = "{\"type\":\"snapshot\"";
+            js += buildT();
             std::lock_guard<std::mutex> lock(hostMutex);
             for (int i = 0; i < NODEFLOW_NUM_PORTS; ++i) {
                 const auto &p = NODEFLOW_PORTS[i];
@@ -296,7 +332,6 @@ int main(int argc, char** argv) {
                 }
                 js += ",\""; js += p.nodeId; js += ":"; js += p.portId; js += "\":";
                 js += jsonNumberForDtype(p.dtype, v, 3);
-                if (outCount[p.nodeId] == 1) { js += ",\""; js += p.nodeId; js += "\":"; js += jsonNumberForDtype(p.dtype, v, 3); }
             }
             js += "}\n";
             return js;
@@ -325,7 +360,7 @@ int main(int argc, char** argv) {
                     auto itPrev = lastOutByHandle.find(p.handle);
                     bool isChanged = (itPrev == lastOutByHandle.end()) || (std::abs(itPrev->second - v) > 1e-9);
                     if (isChanged) {
-                        if (changed == 0) js = "{\"type\":\"delta\""; // start object lazily
+                        if (changed == 0) { js = "{\"type\":\"delta\""; js += buildT(); }
                         js += ",\""; js += p.nodeId; js += ":"; js += p.portId; js += "\":";
                         js += jsonNumberForDtype(p.dtype, v, 3);
                         ++changed;
@@ -387,10 +422,10 @@ int main(int argc, char** argv) {
                             setInputByNode(node, value);
                         }
                     }
-                    // Recompute immediately for instant feedback
+                    // Recompute immediately for instant feedback only if not paused
                     {
                         std::lock_guard<std::mutex> lock(hostMutex);
-                        nodeflow_step(&in, &out, &state);
+                        if (!paused) nodeflow_step(&in, &out, &state);
                     }
                     try { conn->send("{\"ok\":true}\n"); } catch(...) {}
                     // Immediate fast delta on set
@@ -441,6 +476,24 @@ int main(int argc, char** argv) {
                         }
                         lastActivity = std::chrono::steady_clock::now();
                     }
+                } else if (type == "control") {
+                    auto cmd = getStr(data, "cmd");
+                    if (cmd == "pause") { paused = true; try { conn->send("{\"ok\":true}\n"); } catch(...) {} }
+                    else if (cmd == "resume") { paused = false; try { conn->send("{\"ok\":true}\n"); } catch(...) {} }
+                    else if (cmd == "reset") { std::lock_guard<std::mutex> lock(hostMutex); nodeflow_reset(&state); std::memset(&out, 0, sizeof(out)); lastOutByHandle.clear(); try { conn->send("{\"ok\":true}\n"); } catch(...) {} }
+                    else if (cmd == "step_eval") { std::lock_guard<std::mutex> lock(hostMutex); nodeflow_step(&in, &out, &state); try { conn->send("{\"ok\":true}\n"); } catch(...) {} }
+                    else if (cmd == "step_tick") { double dt = getNum(data, "dt_ms"); if (dt < 0) dt = 0.0; { std::lock_guard<std::mutex> lock(hostMutex); nodeflow_tick(dt, &in, &out, &state); nodeflow_step(&in, &out, &state);} try { conn->send("{\"ok\":true}\n"); } catch(...) {} }
+                    else if (cmd == "set_rate") { int hz = (int)getNum(data, "hz"); fixedRateHz = std::max(0, hz); try { conn->send("{\"ok\":true}\n"); } catch(...) {} }
+                    else if (cmd == "set_clock") { auto c = getStr(data, "clock"); if (c=="wall"||c=="virtual") { clockType=c; try { conn->send("{\"ok\":true}\n"); } catch(...) {} } else try { conn->send("{\"ok\":false}\n"); } catch(...) {} }
+                    else if (cmd == "set_time_scale") { double sc = getNum(data, "scale"); if (sc<0) sc=0; timeScale = sc; try { conn->send("{\"ok\":true}\n"); } catch(...) {} }
+                    else if (cmd == "status") {
+                        auto nowSteady = Steady::now(); auto nowSys = Sys::now();
+                        auto wallMs = std::chrono::duration_cast<std::chrono::milliseconds>(nowSys.time_since_epoch()).count();
+                        auto monoNs = std::chrono::duration_cast<std::chrono::nanoseconds>(nowSteady - processStartSteady).count();
+                        std::string s = std::string("{\"type\":\"status\",\"mode\":\"") + (paused?"paused":"running") + "\",";
+                        s += "\"clock\":\"" + clockType + "\",\"time_scale\":" + fmt::format("{:.3f}", timeScale) + ",\"rate_hz\":" + std::to_string(fixedRateHz) + ",\"t\":{\"wall_ms\":" + std::to_string((long long)wallMs) + ",\"mono_ns\":" + std::to_string((long long)monoNs) + "}}\n";
+                        try { conn->send(s); } catch(...) {}
+                    } else { try { conn->send("{\"ok\":false}\n"); } catch(...) {} }
                 } else if (type == "subscribe") {
                     try { conn->send("{\"ok\":true}\n"); } catch(...) {}
                 } else {
@@ -454,6 +507,10 @@ int main(int argc, char** argv) {
             try { conn->send(buildSchema()); } catch(...) {}
             {
                 std::lock_guard<std::mutex> lock(wsMutex);
+                {
+                    std::lock_guard<std::mutex> lock2(hostMutex);
+                    nodeflow_step(&in, &out, &state);
+                }
                 std::string snap = buildSnapshot();
                 latestJson = snap;
                 conn->send(snap);
@@ -482,10 +539,13 @@ int main(int argc, char** argv) {
             {
                 std::lock_guard<std::mutex> lock(hostMutex);
                 auto nowTs = steady_clock::now();
-                auto dtMs = duration_cast<milliseconds>(nowTs - lastTs).count();
+                double dtMs = (double)duration_cast<milliseconds>(nowTs - lastTs).count();
+                if (clockType == "virtual") { dtMs = (fixedRateHz > 0 ? 1000.0 / std::max(1, fixedRateHz) : 16.667); }
+                dtMs *= timeScale;
                 lastTs = nowTs;
-                if (dtMs > 0) nodeflow_tick((double)dtMs, &in, &out, &state);
-                nodeflow_step(&in, &out, &state);
+                lastDtMsObserved = dtMs;
+                if (!paused && dtMs > 0.0) nodeflow_tick(dtMs, &in, &out, &state);
+                if (!paused) nodeflow_step(&in, &out, &state);
             }
             // Print all outputs generically
             for (int i = 0; i < NODEFLOW_NUM_PORTS; ++i) {
@@ -527,10 +587,13 @@ int main(int argc, char** argv) {
                 {
                     std::lock_guard<std::mutex> lock(hostMutex);
                     auto nowTs = std::chrono::steady_clock::now();
-                    auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(nowTs - lastTs).count();
+                    double dtMs = (double)std::chrono::duration_cast<std::chrono::milliseconds>(nowTs - lastTs).count();
+                    if (clockType == "virtual") { dtMs = (fixedRateHz > 0 ? 1000.0 / std::max(1, fixedRateHz) : 16.667); }
+                    dtMs *= timeScale;
                     lastTs = nowTs;
-                    if (dtMs > 0) nodeflow_tick((double)dtMs, &in, &out, &state);
-                    nodeflow_step(&in, &out, &state);
+                    lastDtMsObserved = dtMs;
+                    if (!paused && dtMs > 0.0) nodeflow_tick(dtMs, &in, &out, &state);
+                    if (!paused) nodeflow_step(&in, &out, &state);
                 }
                 std::string snap = buildSnapshot();
                 {
